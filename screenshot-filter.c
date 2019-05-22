@@ -42,7 +42,7 @@ static bool put_data(
 #define SETTING_DESTINATION_IS_FILE "destination_is_url"
 #define SETTING_DESTINATION_PATH "destinaton_path"
 #define SETTING_DESTINATION_URL "destination_url"
-#define SETTING_FREQUENCY "frequency"
+#define SETTING_INTERVAL "interval"
 #define SETTING_RAW "raw"
 
 struct screenshot_filter_data {
@@ -50,7 +50,7 @@ struct screenshot_filter_data {
 	HANDLE                         image_writer_thread;
 
 	char                           *destination;
-	float                          frequency;
+	float                          interval;
 	bool                           raw;
 
 	float                          since_last;
@@ -133,7 +133,7 @@ static obs_properties_t *screenshot_filter_properties(void *data)
 	obs_properties_add_path(props, SETTING_DESTINATION_PATH, "Destination", OBS_PATH_FILE_SAVE, "*.*", NULL);
 	obs_properties_add_text(props, SETTING_DESTINATION_URL, "Destination (url)", OBS_TEXT_DEFAULT);
 
-	obs_properties_add_float_slider(props, SETTING_FREQUENCY, "Frequency (seconds)", 0.25, 60, 0.25);
+	obs_properties_add_float_slider(props, SETTING_INTERVAL, "Interval (seconds)", 0.25, 60, 0.25);
 
 	obs_properties_add_bool(props, SETTING_RAW, "Raw image");
 
@@ -143,7 +143,7 @@ static obs_properties_t *screenshot_filter_properties(void *data)
 static void screenshot_filter_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_bool(settings, SETTING_DESTINATION_IS_FILE, true);
-	obs_data_set_default_double(settings, SETTING_FREQUENCY, 2.0f);
+	obs_data_set_default_double(settings, SETTING_INTERVAL, 2.0f);
 }
 
 static void screenshot_filter_update(void *data, obs_data_t *settings)
@@ -158,7 +158,7 @@ static void screenshot_filter_update(void *data, obs_data_t *settings)
 
 	filter->destination = dest_is_file ? path : url;
 
-	filter->frequency = obs_data_get_double(settings, SETTING_FREQUENCY);
+	filter->interval = obs_data_get_double(settings, SETTING_INTERVAL);
 	filter->raw = obs_data_get_bool(settings, SETTING_RAW);
 
 	ReleaseMutex(filter->mutex);
@@ -180,7 +180,7 @@ static void *screenshot_filter_create(obs_data_t *settings, obs_source_t *contex
 	}
 	info("Created image writer thread");
 
-	filter->frequency = 1.0f;
+	filter->interval = 1.0f;
 
 	filter->mutex = CreateMutexA(NULL, FALSE, NULL);
 
@@ -266,7 +266,7 @@ static void screenshot_filter_tick(void *data, float t)
 	}
 
 	filter->since_last += t;
-	if (filter->since_last > filter->frequency) {
+	if (filter->since_last > filter->interval) {
 		filter->capture = true;
 		filter->since_last = 0.0f;
 	}
