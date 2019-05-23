@@ -90,9 +90,9 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 
 		if (data) {
 			if (raw)
-				write_data(destination, data, linesize * height, "image/rgba32", width, height);
+				write_data(destination, data, linesize * height, "image/rgba32", linesize / 4, height);
 			else
-				write_image(destination, data, linesize, width, height);
+				write_image(destination, data, linesize, linesize / 4, height);
 			bfree(data);
 		}
 		Sleep(200);
