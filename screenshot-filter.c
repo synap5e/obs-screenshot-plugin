@@ -39,7 +39,7 @@ static bool put_data(
 	int width,
 	int height);
 
-#define SETTING_DESTINATION_IS_FILE "destination_is_url"
+#define SETTING_DESTINATION_IS_FILE "destination_is_file"
 #define SETTING_DESTINATION_PATH "destinaton_path"
 #define SETTING_DESTINATION_URL "destination_url"
 #define SETTING_INTERVAL "interval"
