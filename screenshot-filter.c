@@ -39,9 +39,16 @@ static bool put_data(
 	int width,
 	int height);
 
-#define SETTING_DESTINATION_IS_FILE "destination_is_file"
+#define SETTING_DESTINATION_TYPE "destination_type"
+
 #define SETTING_DESTINATION_PATH "destinaton_path"
 #define SETTING_DESTINATION_URL "destination_url"
+#define SETTING_DESTINATION_SHMEM "destination_shmem"
+
+#define SETTING_DESTINATION_PATH_ID 0
+#define SETTING_DESTINATION_URL_ID 1
+#define SETTING_DESTINATION_SHMEM_ID 2
+
 #define SETTING_INTERVAL "interval"
 #define SETTING_RAW "raw"
 
@@ -49,6 +56,7 @@ struct screenshot_filter_data {
 	obs_source_t                   *context;
 	HANDLE                         image_writer_thread;
 
+	int                            destination_type;
 	char                           *destination;
 	float                          interval;
 	bool                           raw;
@@ -64,6 +72,11 @@ struct screenshot_filter_data {
 	uint8_t                        *data;
 	uint32_t                       linesize;
 	bool                           ready;
+
+	uint32_t                       index;
+	char                           shmem_name[256];
+	uint32_t		       shmem_size;
+	HANDLE                         shmem;
 
 	HANDLE                         mutex;
 	bool                           exit;
@@ -89,10 +102,36 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 		ReleaseMutex(filter->mutex);
 
 		if (data) {
-			if (raw)
-				write_data(destination, data, linesize * height, "image/rgba32", linesize / 4, height);
-			else
-				write_image(destination, data, linesize, linesize / 4, height);
+			if (filter->destination_type != SETTING_DESTINATION_SHMEM_ID) {
+				if (raw)
+					write_data(destination, data, linesize * height, "image/rgba32", linesize / 4, height);
+				else
+					write_image(destination, data, linesize, linesize / 4, height);
+			}
+			else {
+				if (filter->shmem) {
+					uint32_t *buf = (uint32_t *)MapViewOfFile(
+						filter->shmem,
+						FILE_MAP_ALL_ACCESS,
+						0,
+						0,
+						filter->shmem_size
+					);
+
+					if (buf)
+					{
+						buf[0] = width;
+						buf[1] = height;
+						buf[2] = linesize;
+						buf[3] = filter->index;
+						memcpy(&buf[4], data, linesize * height);
+					}
+
+					UnmapViewOfFile(buf);
+				}
+			}
+
+			filter->index += 1;
 			bfree(data);
 		}
 		Sleep(200);
@@ -109,15 +148,16 @@ static const char *screenshot_filter_get_name(void *unused)
 	return "Screenshot Filter";
 }
 
-static bool is_file_modified(obs_properties_t *props, obs_property_t *unused, obs_data_t *settings)
+static bool is_dest_modified(obs_properties_t *props, obs_property_t *unused, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(unused);
 
-	bool enabled = obs_data_get_bool(settings, SETTING_DESTINATION_IS_FILE);
-	obs_property_t *path = obs_properties_get(props, SETTING_DESTINATION_PATH);
-	obs_property_t *url = obs_properties_get(props, SETTING_DESTINATION_URL);
-	obs_property_set_visible(path, enabled);
-	obs_property_set_visible(url, !enabled);
+	int type = obs_data_get_int(settings, SETTING_DESTINATION_TYPE);
+	obs_property_set_visible(obs_properties_get(props, SETTING_DESTINATION_PATH), type == SETTING_DESTINATION_PATH_ID);
+	obs_property_set_visible(obs_properties_get(props, SETTING_DESTINATION_URL), type == SETTING_DESTINATION_URL_ID);
+	obs_property_set_visible(obs_properties_get(props, SETTING_DESTINATION_SHMEM), type == SETTING_DESTINATION_SHMEM_ID);
+
+	obs_property_set_visible(obs_properties_get(props, SETTING_RAW), type != SETTING_DESTINATION_SHMEM_ID);
 
 	return true;
 }
@@ -128,10 +168,15 @@ static obs_properties_t *screenshot_filter_properties(void *data)
 
 	obs_properties_t *props = obs_properties_create();
 
-	obs_property_t *p = obs_properties_add_bool(props, SETTING_DESTINATION_IS_FILE, "Ouput to file");
-	obs_property_set_modified_callback(p, is_file_modified);
+	obs_property_t *p = obs_properties_add_list(props, SETTING_DESTINATION_TYPE, "Destination Type", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, "Ouput to file", SETTING_DESTINATION_PATH_ID);
+	obs_property_list_add_int(p, "Ouput to URL", SETTING_DESTINATION_URL_ID);
+	obs_property_list_add_int(p, "Ouput to Named Shared Memory", SETTING_DESTINATION_SHMEM_ID);
+	
+	obs_property_set_modified_callback(p, is_dest_modified);
 	obs_properties_add_path(props, SETTING_DESTINATION_PATH, "Destination", OBS_PATH_FILE_SAVE, "*.*", NULL);
 	obs_properties_add_text(props, SETTING_DESTINATION_URL, "Destination (url)", OBS_TEXT_DEFAULT);
+	obs_properties_add_text(props, SETTING_DESTINATION_SHMEM, "Shared Memory Name", OBS_TEXT_DEFAULT);
 
 	obs_properties_add_float_slider(props, SETTING_INTERVAL, "Interval (seconds)", 0.25, 60, 0.25);
 
@@ -142,7 +187,6 @@ static obs_properties_t *screenshot_filter_properties(void *data)
 
 static void screenshot_filter_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_bool(settings, SETTING_DESTINATION_IS_FILE, true);
 	obs_data_set_default_double(settings, SETTING_INTERVAL, 2.0f);
 }
 
@@ -150,13 +194,23 @@ static void screenshot_filter_update(void *data, obs_data_t *settings)
 {
 	struct screenshot_filter_data *filter = data;
 
-	bool dest_is_file = obs_data_get_bool(settings, SETTING_DESTINATION_IS_FILE);
+	int type = obs_data_get_int(settings, SETTING_DESTINATION_TYPE);
 	char *path = obs_data_get_string(settings, SETTING_DESTINATION_PATH);
 	char *url = obs_data_get_string(settings, SETTING_DESTINATION_URL);
+	char *shmem_name = obs_data_get_string(settings, SETTING_DESTINATION_SHMEM);
 
 	WaitForSingleObject(filter->mutex, INFINITE);
 
-	filter->destination = dest_is_file ? path : url;
+	filter->destination_type = type;
+	if (type == SETTING_DESTINATION_PATH_ID) {
+		filter->destination = path;
+	} else if (type == SETTING_DESTINATION_URL_ID) {
+		filter->destination = url;
+	}
+	else if(type == SETTING_DESTINATION_SHMEM_ID) {
+		filter->destination = shmem_name;
+	}
+	info("Set destination=%s, %d", filter->destination, filter->destination_type);
 
 	filter->interval = obs_data_get_double(settings, SETTING_INTERVAL);
 	filter->raw = obs_data_get_bool(settings, SETTING_RAW);
@@ -181,6 +235,7 @@ static void *screenshot_filter_create(obs_data_t *settings, obs_source_t *contex
 	info("Created image writer thread");
 
 	filter->interval = 1.0f;
+	filter->shmem_name[0] = '\0';
 
 	filter->mutex = CreateMutexA(NULL, FALSE, NULL);
 
@@ -203,6 +258,7 @@ static void screenshot_filter_destroy(void *data)
 		warn("Image writer thread failed to stop");
 	}
 
+	WaitForSingleObject(filter->mutex, INFINITE);
 	obs_enter_graphics();
 	gs_texrender_destroy(filter->texrender);
 	if (filter->staging_texture) {
@@ -212,6 +268,12 @@ static void screenshot_filter_destroy(void *data)
 	if (filter->data) {
 		bfree(filter->data);
 	}
+
+	if (filter->shmem) {
+		CloseHandle(filter->shmem);
+	}
+	ReleaseMutex(filter->mutex);
+	CloseHandle(filter->mutex);
 
 	bfree(filter);
 }
@@ -244,7 +306,11 @@ static void screenshot_filter_tick(void *data, float t)
 	uint32_t width = obs_source_get_base_width(target);
 	uint32_t height = obs_source_get_base_height(target);
 
+	WaitForSingleObject(filter->mutex, INFINITE);
+	bool update = false;
 	if (width != filter->width || height != filter->height) {
+		update = true;
+
 		filter->width = width;
 		filter->height = height;
 
@@ -265,11 +331,36 @@ static void screenshot_filter_tick(void *data, float t)
 		filter->since_last = 0.0f;
 	}
 
+	if (filter->destination_type == SETTING_DESTINATION_SHMEM_ID && filter->destination) {
+		if (update || strncmp(filter->destination, filter->shmem_name, sizeof(filter->shmem_name))) {
+			info("update shmem");
+			if (filter->shmem) {
+				info("Closing shmem \"%s\": %x", filter->shmem_name, filter->shmem);
+				CloseHandle(filter->shmem);
+			}
+			filter->shmem_size = 12 + (width + 32) * height * 4;
+			wchar_t name[256];
+			mbstowcs(name, filter->destination, sizeof(name));
+			filter->shmem = CreateFileMapping(
+				INVALID_HANDLE_VALUE,
+				NULL,
+				PAGE_READWRITE,
+				0,
+				filter->shmem_size,
+				name
+			);
+			strncpy(filter->shmem_name, filter->destination, sizeof(filter->shmem_name));
+			info("Created shmem \"%s\": %x", filter->shmem_name, filter->shmem);
+		}
+	}
+
 	filter->since_last += t;
-	if (filter->since_last > filter->interval) {
+	if (filter->since_last > filter->interval - 0.05) {
 		filter->capture = true;
 		filter->since_last = 0.0f;
 	}
+
+	ReleaseMutex(filter->mutex);
 }
 
 
@@ -504,7 +595,7 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type, in
 	char *location = location_start;
 
 	HINTERNET hIntrn = InternetOpenA(
-		"OBS Screenshot Plugin/1.0.0",
+		"OBS Screenshot Plugin/1.2.0",
 		INTERNET_OPEN_TYPE_PRECONFIG_WITH_NO_AUTOPROXY,
 		NULL,
 		NULL,
