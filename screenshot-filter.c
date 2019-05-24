@@ -561,7 +561,7 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type, in
 	char *port_start = strchr(host_start, ':');
 	char *location_start = strchr(host_start, '/');
 	if (!location_start)
-		return false;
+		location_start = "";
 
 	int port;
 	if (port_start != NULL) {
