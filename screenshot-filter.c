@@ -372,7 +372,7 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 	obs_source_t *target = obs_filter_get_target(filter->context);
 	obs_source_t *parent = obs_filter_get_parent(filter->context);
 
-	if (!parent || !filter->width || !filter->height) {
+	if (!parent || !filter->width || !filter->height || !filter->capture) {
 		obs_source_skip_video_filter(filter->context);
 		return;
 	}
@@ -409,22 +409,20 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 	gs_texture_t *tex = gs_texrender_get_texture(filter->texrender);
 
 	if (tex) {
-		if (filter->capture) {
-			gs_stage_texture(filter->staging_texture, tex);
+		gs_stage_texture(filter->staging_texture, tex);
 
-			uint8_t *data;
-			uint32_t linesize;
-			WaitForSingleObject(filter->mutex, INFINITE);
-			if (gs_stagesurface_map(filter->staging_texture, &data, &linesize)) {
-				memcpy(filter->data, data, linesize * filter->height);
-				filter->linesize = linesize;
-				filter->ready = true;
+		uint8_t *data;
+		uint32_t linesize;
+		WaitForSingleObject(filter->mutex, INFINITE);
+		if (gs_stagesurface_map(filter->staging_texture, &data, &linesize)) {
+			memcpy(filter->data, data, linesize * filter->height);
+			filter->linesize = linesize;
+			filter->ready = true;
 
-				gs_stagesurface_unmap(filter->staging_texture);
-			}
-			filter->capture = false;
-			ReleaseMutex(filter->mutex);
+			gs_stagesurface_unmap(filter->staging_texture);
 		}
+		filter->capture = false;
+		ReleaseMutex(filter->mutex);
 
 		gs_eparam_t *image = gs_effect_get_param_by_name(effect2, "image");
 		gs_effect_set_texture(image, tex);
