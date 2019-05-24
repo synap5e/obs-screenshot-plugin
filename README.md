@@ -2,6 +2,9 @@
 
 This [OBS Studio](https://obsproject.com) filter saves images of the attatched source at a defined interval. Images can be RGBA32 .png files or raw bytes. Images can be saved to a local file or PUT to an http server.
 
+Note that the file output mode writes to the same file each time.
+A directory mode is [planned](https://github.com/synap5e/obs-screenshot-plugin/issues/2)
+
 ![demo.png](https://raw.githubusercontent.com/synap5e/obs-screenshot-plugin/readme-images/demo.png) 
 
 ### Named Shared Memory Output
