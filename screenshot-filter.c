@@ -593,7 +593,7 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type, in
 	char *location = location_start;
 
 	HINTERNET hIntrn = InternetOpenA(
-		"OBS Screenshot Plugin/1.2.0",
+		"OBS Screenshot Plugin/1.2.1",
 		INTERNET_OPEN_TYPE_PRECONFIG_WITH_NO_AUTOPROXY,
 		NULL,
 		NULL,
