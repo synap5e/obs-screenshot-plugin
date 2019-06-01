@@ -550,7 +550,7 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type, in
 {
 	bool success = false;
 
-	char *host_start = strchr(url, '/');
+	char *host_start = strstr(url, "://");
 	if (host_start == NULL)
 		return false;
 	host_start += 2;
