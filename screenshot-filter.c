@@ -101,7 +101,7 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 		}
 		ReleaseMutex(filter->mutex);
 
-		if (data) {
+		if (data && width > 10 && height > 10) {
 			if (filter->destination_type != SETTING_DESTINATION_SHMEM_ID) {
 				if (raw)
 					write_data(destination, data, linesize * height, "image/rgba32", linesize / 4, height);
