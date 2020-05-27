@@ -18,7 +18,6 @@ OBS_MODULE_USE_DEFAULT_LOCALE("screenshot-filter", "en-US")
 #define info(format, ...) do_log(LOG_INFO, format, ##__VA_ARGS__)
 #define debug(format, ...) do_log(LOG_DEBUG, format, ##__VA_ARGS__)
 
-static obs_hotkey_id capture_key = 0;
 static void capture_key_callback(void *data, obs_hotkey_id id,
 				 obs_hotkey_t *key, bool pressed);
 
@@ -38,10 +37,10 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 #define SETTING_DESTINATION_URL "destination_url"
 #define SETTING_DESTINATION_SHMEM "destination_shmem"
 
-#define SETTING_DESTINATION_FOLDER_ID 0
-#define SETTING_DESTINATION_PATH_ID 1
-#define SETTING_DESTINATION_URL_ID 2
-#define SETTING_DESTINATION_SHMEM_ID 3
+#define SETTING_DESTINATION_PATH_ID 0
+#define SETTING_DESTINATION_URL_ID 1
+#define SETTING_DESTINATION_SHMEM_ID 2
+#define SETTING_DESTINATION_FOLDER_ID 3
 
 #define SETTING_TIMER "timer"
 #define SETTING_INTERVAL "interval"
@@ -57,6 +56,7 @@ struct screenshot_filter_data {
 	bool timer;
 	float interval;
 	bool raw;
+	obs_hotkey_id capture_hotkey_id;
 
 	float since_last;
 	bool capture;
@@ -100,7 +100,26 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 		ReleaseMutex(filter->mutex);
 
 		if (data && width > 10 && height > 10) {
-			if (raw)
+			if (destination_type == SETTING_DESTINATION_SHMEM_ID) {
+				if (filter->shmem) {
+					uint32_t *buf =
+						(uint32_t *)MapViewOfFile(
+							filter->shmem,
+							FILE_MAP_ALL_ACCESS, 0,
+							0, filter->shmem_size);
+
+					if (buf) {
+						buf[0] = width;
+						buf[1] = height;
+						buf[2] = linesize;
+						buf[3] = filter->index;
+						memcpy(&buf[4], data,
+						       linesize * height);
+					}
+
+					UnmapViewOfFile(buf);
+				}
+			} else if (raw)
 				write_data(destination, data, linesize * height,
 					   "image/rgba32", linesize / 4, height,
 					   destination_type);
@@ -146,6 +165,9 @@ static bool is_dest_modified(obs_properties_t *props, obs_property_t *unused,
 	obs_property_set_visible(obs_properties_get(props, SETTING_RAW),
 				 type != SETTING_DESTINATION_SHMEM_ID);
 
+	obs_property_set_visible(obs_properties_get(props, SETTING_TIMER),
+				 type != SETTING_DESTINATION_SHMEM_ID);
+
 	return true;
 }
 
@@ -155,9 +177,11 @@ static bool is_timer_enable_modified(obs_properties_t *props,
 {
 	UNUSED_PARAMETER(unused);
 
+	int type = obs_data_get_int(settings, SETTING_DESTINATION_TYPE);
 	bool is_timer_enable = obs_data_get_bool(settings, SETTING_TIMER);
 	obs_property_set_visible(obs_properties_get(props, SETTING_INTERVAL),
-				 is_timer_enable);
+				 is_timer_enable ||
+					 type == SETTING_DESTINATION_SHMEM_ID);
 
 	return true;
 }
@@ -206,7 +230,11 @@ static obs_properties_t *screenshot_filter_properties(void *data)
 
 static void screenshot_filter_defaults(obs_data_t *settings)
 {
+	obs_data_set_default_double(settings, SETTING_DESTINATION_TYPE,
+				    SETTING_DESTINATION_FOLDER_ID);
+	obs_data_set_default_bool(settings, SETTING_TIMER, false);
 	obs_data_set_default_double(settings, SETTING_INTERVAL, 2.0f);
+	obs_data_set_default_bool(settings, SETTING_RAW, false);
 }
 
 static void screenshot_filter_update(void *data, obs_data_t *settings)
@@ -220,7 +248,7 @@ static void screenshot_filter_update(void *data, obs_data_t *settings)
 		obs_data_get_string(settings, SETTING_DESTINATION_SHMEM);
 	char *folder_path =
 		obs_data_get_string(settings, SETTING_DESTINATION_FOLDER);
-	bool is_timer_enabled = obs_data_get_bool(settings, SETTING_TIMER);
+	bool is_timer_enabled = obs_data_get_bool(settings, SETTING_TIMER) || type == SETTING_DESTINATION_SHMEM_ID;
 
 	WaitForSingleObject(filter->mutex, INFINITE);
 
@@ -244,36 +272,13 @@ static void screenshot_filter_update(void *data, obs_data_t *settings)
 	ReleaseMutex(filter->mutex);
 }
 
-static void filter_save(obs_data_t *save_data, bool saving, void *unused)
-{
-	obs_data_t *data = NULL;
-	obs_data_array_t *capture = NULL;
-	UNUSED_PARAMETER(unused);
-
-	if (saving) {
-		data = obs_data_create();
-		capture = obs_hotkey_save(capture_key);
-		obs_data_set_array(data, "capture_hotkey", capture);
-		obs_data_set_obj(save_data, "screenshot-filter", data);
-		obs_data_array_release(capture);
-		obs_data_release(data);
-	} else {
-		data = obs_data_get_obj(save_data, "screenshot-filter");
-		if (!data)
-			data = obs_data_create();
-		capture = obs_data_get_array(data, "capture_hotkey");
-
-		obs_hotkey_load(capture_key, capture);
-		obs_data_array_release(capture);
-		obs_data_release(data);
-	}
-}
-
 static void *screenshot_filter_create(obs_data_t *settings,
 				      obs_source_t *context)
 {
 	struct screenshot_filter_data *filter =
 		bzalloc(sizeof(struct screenshot_filter_data));
+	info("Created filter: %p", filter);
+
 	filter->context = context;
 
 	obs_enter_graphics();
@@ -288,26 +293,52 @@ static void *screenshot_filter_create(obs_data_t *settings,
 	}
 	info("Created image writer thread %d", filter);
 
-	filter->interval = 1.0f;
+	filter->interval = 2.0f;
 	filter->shmem_name[0] = '\0';
 
 	filter->mutex = CreateMutexA(NULL, FALSE, NULL);
 
-	char *filter_name = obs_source_get_name(filter->context);
-	char hotkey_name[256];
-	char hotkey_description[256];
-	snprintf(hotkey_name, 255, "%s.screenshot", filter_name);
-	snprintf(hotkey_description, 255, "Screenshot: %s", filter_name);
-	capture_key = obs_hotkey_register_frontend(
-		hotkey_name, hotkey_description, capture_key_callback, filter);
-	obs_frontend_add_save_callback(&filter_save, NULL);
-	info("Hotkey enabled %s %s, %d, %s", hotkey_name, hotkey_description,
-	     capture_key, filter_name);
-
-
 	obs_source_update(context, settings);
 
 	return filter;
+}
+
+static void screenshot_filter_save(void *data, obs_data_t *settings)
+{
+	struct screenshot_filter_data *filter = data;
+
+	obs_data_array_t *hotkeys = obs_hotkey_save(filter->capture_hotkey_id);
+	obs_data_set_array(settings, "capture_hotkey", hotkeys);
+	obs_data_array_release(hotkeys);
+}
+
+static void screenshot_filter_load(void *data, obs_data_t *settings)
+{
+	struct screenshot_filter_data *filter = data;
+	char *filter_name = obs_source_get_name(filter->context);
+
+	obs_source_t *parent = obs_filter_get_parent(filter->context);
+	char *parent_name = obs_source_get_name(parent);
+
+	char hotkey_name[256];
+	char hotkey_description[512];
+	snprintf(hotkey_name, 255, "Screenshot Filter.%s.%s", parent_name,
+		 filter_name);
+	snprintf(hotkey_description, 512, "%s: Take screenshot of \"%s\"",
+		 filter_name, parent_name);
+	filter->capture_hotkey_id = obs_hotkey_register_frontend(
+		hotkey_name, hotkey_description, capture_key_callback, filter);
+
+	info("Registered hotkey on %s: %s %s, key=%d", filter_name, hotkey_name,
+	     hotkey_description, filter->capture_hotkey_id);
+
+	obs_data_array_t *hotkeys =
+		obs_data_get_array(settings, "capture_hotkey");
+	if (obs_data_array_count(hotkeys)) {
+		info("Restoring hotkeys for %s", hotkey_name);
+		obs_hotkey_load(filter->capture_hotkey_id, hotkeys);
+	}
+	obs_data_array_release(hotkeys);
 }
 
 static void screenshot_filter_destroy(void *data)
@@ -347,10 +378,10 @@ static void screenshot_filter_destroy(void *data)
 
 static void screenshot_filter_remove(void *data, obs_source_t *context)
 {
-	if (capture_key) {
-		obs_hotkey_unregister(capture_key);
-		capture_key = 0;
-		obs_frontend_remove_save_callback(&filter_save, NULL);
+	struct screenshot_filter_data *filter = data;
+	if (filter->capture_hotkey_id) {
+		obs_hotkey_unregister(filter->capture_hotkey_id);
+		filter->capture_hotkey_id = 0;
 	}
 }
 
@@ -793,12 +824,13 @@ static void capture_key_callback(void *data, obs_hotkey_id id,
 {
 	struct screenshot_filter_data *filter = data;
 	char *filter_name = obs_source_get_name(filter->context);
-	info("Key clicked, filter: %s, id: %d, key: %s, pressed: %d",
+	info("Got capture_key pressed for %s, id: %d, key: %s, pressed: %d",
 	     filter_name, id, key->name, pressed);
-	if (id != capture_key || !pressed)
-		return;
-	info("Size width: %d, height: %d", filter->width, filter->height);
 
+	if (id != filter->capture_hotkey_id || !pressed)
+		return;
+
+	info("Triggering capture");
 	WaitForSingleObject(filter->mutex, INFINITE);
 	filter->capture = true;
 	ReleaseMutex(filter->mutex);
@@ -818,6 +850,9 @@ struct obs_source_info screenshot_filter = {
 
 	.create = screenshot_filter_create,
 	.destroy = screenshot_filter_destroy,
+
+	.save = screenshot_filter_save,
+	.load = screenshot_filter_load,
 
 	.video_tick = screenshot_filter_tick,
 	.video_render = screenshot_filter_render,
