@@ -168,6 +168,11 @@ static bool is_dest_modified(obs_properties_t *props, obs_property_t *unused,
 	obs_property_set_visible(obs_properties_get(props, SETTING_TIMER),
 				 type != SETTING_DESTINATION_SHMEM_ID);
 
+	bool is_timer_enable = obs_data_get_bool(settings, SETTING_TIMER);
+	obs_property_set_visible(obs_properties_get(props, SETTING_INTERVAL),
+				 is_timer_enable ||
+					 type == SETTING_DESTINATION_SHMEM_ID);
+
 	return true;
 }
 
@@ -248,7 +253,7 @@ static void screenshot_filter_update(void *data, obs_data_t *settings)
 		obs_data_get_string(settings, SETTING_DESTINATION_SHMEM);
 	char *folder_path =
 		obs_data_get_string(settings, SETTING_DESTINATION_FOLDER);
-	bool is_timer_enabled = obs_data_get_bool(settings, SETTING_TIMER) || type == SETTING_DESTINATION_SHMEM_ID;
+	bool is_timer_enabled = obs_data_get_bool(settings, SETTING_TIMER);
 
 	WaitForSingleObject(filter->mutex, INFINITE);
 
@@ -265,7 +270,8 @@ static void screenshot_filter_update(void *data, obs_data_t *settings)
 	info("Set destination=%s, %d", filter->destination,
 	     filter->destination_type);
 
-	filter->timer = is_timer_enabled;
+	filter->timer = is_timer_enabled ||
+			type == SETTING_DESTINATION_SHMEM_ID;
 	filter->interval = obs_data_get_double(settings, SETTING_INTERVAL);
 	filter->raw = obs_data_get_bool(settings, SETTING_RAW);
 
