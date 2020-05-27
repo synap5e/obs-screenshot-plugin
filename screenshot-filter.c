@@ -121,11 +121,11 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 				}
 			} else if (raw)
 				write_data(destination, data, linesize * height,
-					   "image/rgba32", linesize / 4, height,
+					   "image/rgba32", width, height,
 					   destination_type);
 			else
 				write_image(destination, data, linesize,
-					    linesize / 4, height,
+					    width, height,
 					    destination_type);
 			filter->index += 1;
 			bfree(data);
@@ -587,11 +587,11 @@ static bool write_image(const char *destination, uint8_t *image_data_ptr,
 		goto err_av_frame_alloc;
 
 	frame->format = codec_context->pix_fmt;
-	frame->width = codec_context->width;
-	frame->height = codec_context->height;
+	frame->width = width;
+	frame->height = height;
 
 	ret = av_image_alloc(frame->data, frame->linesize, codec_context->width,
-			     codec_context->height, codec_context->pix_fmt, 32);
+			     codec_context->height, codec_context->pix_fmt, 4);
 	if (ret < 0)
 		goto err_av_image_alloc;
 
@@ -599,7 +599,10 @@ static bool write_image(const char *destination, uint8_t *image_data_ptr,
 	pkt.data = NULL;
 	pkt.size = 0;
 
-	memcpy(frame->data[0], image_data_ptr, image_data_linesize * height);
+	for (int y=0; y<height; ++y)
+		memcpy(frame->data[0] + y * width * 4,
+		       image_data_ptr + y * image_data_linesize,
+		       width * 4);
 	frame->pts = 1;
 
 	int got_output = 0;
