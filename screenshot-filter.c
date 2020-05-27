@@ -689,7 +689,7 @@ static bool write_data(char *destination, uint8_t *data, size_t len,
 						       "%s", _file_destination);
 				if (repeat_count > 0) {
 					dest_length = snprintf(
-						file_destination, 259, "%s_%d",
+						file_destination, 259, "%s_%d.raw",
 						_file_destination,
 						repeat_count);
 				}
