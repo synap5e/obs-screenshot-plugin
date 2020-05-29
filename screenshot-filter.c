@@ -124,9 +124,8 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 					   "image/rgba32", width, height,
 					   destination_type);
 			else
-				write_image(destination, data, linesize,
-					    width, height,
-					    destination_type);
+				write_image(destination, data, linesize, width,
+					    height, destination_type);
 			filter->index += 1;
 			bfree(data);
 		}
@@ -318,9 +317,8 @@ static void screenshot_filter_save(void *data, obs_data_t *settings)
 	obs_data_array_release(hotkeys);
 }
 
-static void screenshot_filter_load(void *data, obs_data_t *settings)
+static void make_hotkey(struct screenshot_filter_data *filter)
 {
-	struct screenshot_filter_data *filter = data;
 	char *filter_name = obs_source_get_name(filter->context);
 
 	obs_source_t *parent = obs_filter_get_parent(filter->context);
@@ -332,16 +330,29 @@ static void screenshot_filter_load(void *data, obs_data_t *settings)
 		 filter_name);
 	snprintf(hotkey_description, 512, "%s: Take screenshot of \"%s\"",
 		 filter_name, parent_name);
-	filter->capture_hotkey_id = obs_hotkey_register_frontend(
-		hotkey_name, hotkey_description, capture_key_callback, filter);
 
-	info("Registered hotkey on %s: %s %s, key=%d", filter_name, hotkey_name,
-	     hotkey_description, filter->capture_hotkey_id);
+	filter->capture_hotkey_id = obs_hotkey_register_frontend(
+		hotkey_name, hotkey_description, capture_key_callback,
+		filter);
+
+	info("Registered hotkey on %s: %s %s, key=%d", filter_name,
+		hotkey_name, hotkey_description,
+		filter->capture_hotkey_id);
+	
+}
+
+static void screenshot_filter_load(void *data, obs_data_t *settings)
+{
+	struct screenshot_filter_data *filter = data;
+
+	info("Registering hotkey on filter load for filter %p", filter);
+	make_hotkey(filter);
 
 	obs_data_array_t *hotkeys =
 		obs_data_get_array(settings, "capture_hotkey");
-	if (obs_data_array_count(hotkeys)) {
-		info("Restoring hotkeys for %s", hotkey_name);
+	if (filter->capture_hotkey_id && obs_data_array_count(hotkeys)) {
+		info("Restoring hotkey settings for %d",
+		     filter->capture_hotkey_id);
 		obs_hotkey_load(filter->capture_hotkey_id, hotkeys);
 	}
 	obs_data_array_release(hotkeys);
@@ -486,6 +497,11 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 	struct screenshot_filter_data *filter = data;
 	UNUSED_PARAMETER(effect);
 
+	if (!filter->capture_hotkey_id) {
+		info("Registering hotkey on filter render for filter %p", filter);
+		make_hotkey(filter);
+	}
+
 	obs_source_t *target = obs_filter_get_target(filter->context);
 	obs_source_t *parent = obs_filter_get_parent(filter->context);
 
@@ -599,10 +615,9 @@ static bool write_image(const char *destination, uint8_t *image_data_ptr,
 	pkt.data = NULL;
 	pkt.size = 0;
 
-	for (int y=0; y<height; ++y)
+	for (int y = 0; y < height; ++y)
 		memcpy(frame->data[0] + y * width * 4,
-		       image_data_ptr + y * image_data_linesize,
-		       width * 4);
+		       image_data_ptr + y * image_data_linesize, width * 4);
 	frame->pts = 1;
 
 	int got_output = 0;
@@ -692,8 +707,8 @@ static bool write_data(char *destination, uint8_t *data, size_t len,
 						       "%s", _file_destination);
 				if (repeat_count > 0) {
 					dest_length = snprintf(
-						file_destination, 259, "%s_%d.raw",
-						_file_destination,
+						file_destination, 259,
+						"%s_%d.raw", _file_destination,
 						repeat_count);
 				}
 				repeat_count++;
