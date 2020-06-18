@@ -24,8 +24,17 @@ The image will be PUT to the specified URL on  on hotkey/timer. The headers `Ima
 
 To facilitate efficient high frequency access to image data, the 'Ouput to Named Shared Memory' option may be used.
 This method uses CreateFileMapping with INVALID_HANDLE_VALUE to create a shared memory region that may be read by other processes.
-In this mode, the screenshot filter writes 16 bytes of header information followed by the raw RGBA data to the named shared memory.
-The header comprises of 4 uint32_t's in the format width, height, linesize, index.
-The header is then followed by `height * linesize` bytes of image data.
 
 This output method forces raw image and timer mode.
+
+## Raw output
+
+In this mode, rather than writing/posting a .png file, the screenshot filter writes the image data uncompressed.
+The .raw format consists of 16 bytes of header information followed by the raw RGBA data to the named shared memory.
+The header comprises of 4 uint32_t's in the format width, height, linesize, index.
+The header is then followed by `height * linesize` bytes of image data. 
+Note that the linesize and width may differ (e.g. `linesize%32=0`, width not constrained), so to get an image of size width\*height you may need to do strided copy. 
+
+## Timer
+
+In this mode, you can select for the image to be written automatically on a timer (between 250ms and 60s) in addition to on a hotkey.
