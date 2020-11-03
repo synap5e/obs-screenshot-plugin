@@ -224,8 +224,8 @@ static obs_properties_t *screenshot_filter_properties(void *data)
 	obs_property_set_modified_callback(p_enable_timer,
 					   is_timer_enable_modified);
 
-	obs_properties_add_float_slider(props, SETTING_INTERVAL,
-					"Interval (seconds)", 0.25, 60, 0.25);
+	obs_properties_add_float(props, SETTING_INTERVAL,
+					"Interval (seconds)", 0.25, 86400, 0.25);
 
 	obs_properties_add_bool(props, SETTING_RAW, "Raw image");
 
