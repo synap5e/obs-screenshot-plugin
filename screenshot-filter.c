@@ -761,6 +761,20 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 		location_start = "";
 
 	int port;
+
+	char *https = NULL;
+	https = strstr(url, "https://");
+	if (https == url) {
+		port = 443;
+
+		// unsupported
+		warn("https unsupported");
+		return false;
+	} else {
+		port = 80;
+	}
+	host_end = location_start;
+
 	if (port_start != NULL) {
 		// have port specifier
 		host_end = port_start;
@@ -773,18 +787,6 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 			return false;
 		port = atoi(port_str);
 
-	} else {
-		char *https = strstr(url, "https://");
-		if (https != NULL) {
-			port = 443;
-
-			// unsupported
-			warn("https unsupported");
-			return false;
-		} else {
-			port = 80;
-		}
-		host_end = location_start;
 	}
 
 	char host[128] = {0};
