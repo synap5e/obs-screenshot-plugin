@@ -18,7 +18,7 @@ Files will be written on a hotkey/timer to the selected folder with a name in th
 The named file will be written to on a hotkey/timer. Note that this will overwrite the file each time.
 
 ### Output to URL
-The image will be PUT to the specified URL on  on hotkey/timer. The headers `Image-Width` and `Image-Height` will be included and may be useful for raw image mode.
+The image will be PUT to the specified URL (https is not supported) on hotkey/timer. The headers `Image-Width` and `Image-Height` will be included and may be useful for raw image mode.
 
 ### Output to Named Shared Memory Output
 
