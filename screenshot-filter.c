@@ -694,7 +694,7 @@ static bool write_data(char *destination, uint8_t *data, size_t len,
 			int dest_length = snprintf(
 				_file_destination, 259,
 				"%s/%d-%02d-%02d_%02d-%02d-%02d", destination,
-				nowtime->tm_year + 1900, nowtime->tm_mon,
+				nowtime->tm_year + 1900, nowtime->tm_mon + 1,
 				nowtime->tm_mday, nowtime->tm_hour,
 				nowtime->tm_min, nowtime->tm_sec);
 
@@ -752,7 +752,7 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 	char *host_start = strstr(url, "://");
 	if (host_start == NULL)
 		return false;
-	host_start += 2;
+	host_start += 3;
 
 	char *host_end;
 	char *port_start = strchr(host_start, ':');
@@ -774,8 +774,8 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 		port = atoi(port_str);
 
 	} else {
-		char *https = strstr(url, "https");
-		if (https == NULL || https > host_start) {
+		char *https = strstr(url, "https://");
+		if (https != NULL) {
 			port = 443;
 
 			// unsupported
