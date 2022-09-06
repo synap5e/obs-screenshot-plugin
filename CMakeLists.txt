@@ -1,21 +1,38 @@
-project(obs-screenshot-filter)
+cmake_minimum_required(VERSION 3.16...3.21)
+
+project(obs-screenshot-filter VERSION 1.4.0)
+add_library(obs-screenshot-filter MODULE)
+
 set(PROJECT_FULL_NAME "Screenshot filter")
+
+set(PLUGIN_AUTHOR "synap5e")
+
+# Add your custom source files here - header files are optional and only required for visibility
+# e.g. in Xcode or Visual Studio
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE screenshot-filter.c)
+
+# Import libobs as main plugin dependency
+find_package(libobs REQUIRED)
+include(cmake/ObsPluginHelpers.cmake)
 
 find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil avformat swscale swresample)
 include_directories(${FFMPEG_INCLUDE_DIRS})
 
-set(obs-screenshot-filter_SOURCES
-      screenshot-filter.c
-)
+target_link_libraries(obs-screenshot-filter OBS::libobs OBS:ffmpeg wininet.lib ${FFMPEG_LIBRARIES})
 
-add_library(obs-screenshot-filter MODULE
-      ${obs-screenshot-filter_SOURCES})
-target_link_libraries(obs-screenshot-filter
-      libobs
-      wininet.lib
-      ${obs-ffmpeg_PLATFORM_DEPS}
-      ${FFMPEG_LIBRARIES}
-)
+# --- Windows-specific build settings and tasks ---
+if(OS_WINDOWS)
+  configure_file(cmake/bundle/windows/installer-Windows.iss.in
+                 ${CMAKE_BINARY_DIR}/installer-Windows.generated.iss)
+
+  configure_file(cmake/bundle/windows/resource.rc.in ${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.rc)
+  target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.rc)
+
+  if(MSVC)
+    target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE /WX-)
+  endif()
+  # --- End of section ---
+endif()
 
 set_target_properties(obs-screenshot-filter PROPERTIES FOLDER "plugins")
-install_obs_plugin_with_data(obs-screenshot-filter data)
+setup_plugin_target(${CMAKE_PROJECT_NAME})
