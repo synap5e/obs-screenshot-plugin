@@ -25,7 +25,7 @@ static void capture_key_callback(void *data, obs_hotkey_id id,
 static bool write_image(const char *destination, uint8_t *image_data_ptr,
 			uint32_t image_data_linesize, uint32_t width,
 			uint32_t height, int destination_type);
-static bool write_data(char *destination, uint8_t *data, size_t len,
+static bool write_data(const char *destination, uint8_t *data, size_t len,
 		       char *content_type, uint32_t width, uint32_t height,
 		       int destination_type);
 static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
@@ -148,7 +148,7 @@ static bool is_dest_modified(obs_properties_t *props, obs_property_t *unused,
 {
 	UNUSED_PARAMETER(unused);
 
-	int type = obs_data_get_int(settings, SETTING_DESTINATION_TYPE);
+	int type = (int)obs_data_get_int(settings, SETTING_DESTINATION_TYPE);
 	obs_property_set_visible(obs_properties_get(props,
 						    SETTING_DESTINATION_FOLDER),
 				 type == SETTING_DESTINATION_FOLDER_ID);
@@ -182,7 +182,7 @@ static bool is_timer_enable_modified(obs_properties_t *props,
 {
 	UNUSED_PARAMETER(unused);
 
-	int type = obs_data_get_int(settings, SETTING_DESTINATION_TYPE);
+	int type = (int)obs_data_get_int(settings, SETTING_DESTINATION_TYPE);
 	bool is_timer_enable = obs_data_get_bool(settings, SETTING_TIMER);
 	obs_property_set_visible(obs_properties_get(props, SETTING_INTERVAL),
 				 is_timer_enable ||
@@ -246,12 +246,14 @@ static void screenshot_filter_update(void *data, obs_data_t *settings)
 {
 	struct screenshot_filter_data *filter = data;
 
-	int type = obs_data_get_int(settings, SETTING_DESTINATION_TYPE);
-	char *path = obs_data_get_string(settings, SETTING_DESTINATION_PATH);
-	char *url = obs_data_get_string(settings, SETTING_DESTINATION_URL);
-	char *shmem_name =
+	int type = (int)obs_data_get_int(settings, SETTING_DESTINATION_TYPE);
+	const char *path =
+		obs_data_get_string(settings, SETTING_DESTINATION_PATH);
+	const char *url =
+		obs_data_get_string(settings, SETTING_DESTINATION_URL);
+	const char *shmem_name =
 		obs_data_get_string(settings, SETTING_DESTINATION_SHMEM);
-	char *folder_path =
+	const char *folder_path =
 		obs_data_get_string(settings, SETTING_DESTINATION_FOLDER);
 	bool is_timer_enabled = obs_data_get_bool(settings, SETTING_TIMER);
 
@@ -259,20 +261,21 @@ static void screenshot_filter_update(void *data, obs_data_t *settings)
 
 	filter->destination_type = type;
 	if (type == SETTING_DESTINATION_PATH_ID) {
-		filter->destination = path;
+		filter->destination = (char *)path;
 	} else if (type == SETTING_DESTINATION_URL_ID) {
-		filter->destination = url;
+		filter->destination = (char *)url;
 	} else if (type == SETTING_DESTINATION_SHMEM_ID) {
-		filter->destination = shmem_name;
+		filter->destination = (char *)shmem_name;
 	} else if (type == SETTING_DESTINATION_FOLDER_ID) {
-		filter->destination = folder_path;
+		filter->destination = (char *)folder_path;
 	}
 	info("Set destination=%s, %d", filter->destination,
 	     filter->destination_type);
 
 	filter->timer = is_timer_enabled ||
 			type == SETTING_DESTINATION_SHMEM_ID;
-	filter->interval = obs_data_get_double(settings, SETTING_INTERVAL);
+	filter->interval =
+		(float)obs_data_get_double(settings, SETTING_INTERVAL);
 	filter->raw = obs_data_get_bool(settings, SETTING_RAW);
 
 	ReleaseMutex(filter->mutex);
@@ -320,10 +323,10 @@ static void screenshot_filter_save(void *data, obs_data_t *settings)
 
 static void make_hotkey(struct screenshot_filter_data *filter)
 {
-	char *filter_name = obs_source_get_name(filter->context);
+	const char *filter_name = obs_source_get_name(filter->context);
 
 	obs_source_t *parent = obs_filter_get_parent(filter->context);
-	char *parent_name = obs_source_get_name(parent);
+	const char *parent_name = obs_source_get_name(parent);
 
 	char hotkey_name[256];
 	char hotkey_description[512];
@@ -580,7 +583,7 @@ static bool write_image(const char *destination, uint8_t *image_data_ptr,
 	if (image_data_ptr == NULL)
 		goto err_no_image_data;
 
-	AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
+	const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
 	if (codec == NULL)
 		goto err_png_codec_not_found;
 
@@ -670,7 +673,7 @@ err_no_image_data:
 	return success;
 }
 
-static bool write_data(char *destination, uint8_t *data, size_t len,
+static bool write_data(const char *destination, uint8_t *data, size_t len,
 		       char *content_type, uint32_t width, uint32_t height,
 		       int destination_type)
 {
@@ -862,7 +865,7 @@ static void capture_key_callback(void *data, obs_hotkey_id id,
 				 obs_hotkey_t *key, bool pressed)
 {
 	struct screenshot_filter_data *filter = data;
-	char *filter_name = obs_source_get_name(filter->context);
+	const char *filter_name = obs_source_get_name(filter->context);
 	info("Got capture_key pressed for %s, id: %d, key: %s, pressed: %d",
 	     filter_name, id, obs_hotkey_get_name(key), pressed);
 
