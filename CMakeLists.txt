@@ -18,7 +18,7 @@ include(cmake/ObsPluginHelpers.cmake)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules/")
 
 find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil avformat swscale swresample)
-include_directories(${FFMPEG_INCLUDE_DIRS})
+target_include_directories(obs-screenshot-filter PRIVATE ${FFMPEG_INCLUDE_DIRS})
 
 target_link_libraries(obs-screenshot-filter PRIVATE OBS::libobs wininet)
 
