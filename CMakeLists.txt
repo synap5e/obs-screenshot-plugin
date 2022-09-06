@@ -15,6 +15,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE screenshot-filter.c)
 find_package(libobs REQUIRED)
 include(cmake/ObsPluginHelpers.cmake)
 
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules/")
+
 find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil avformat swscale swresample)
 include_directories(${FFMPEG_INCLUDE_DIRS})
 
