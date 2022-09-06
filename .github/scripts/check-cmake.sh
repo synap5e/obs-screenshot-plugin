@@ -36,6 +36,7 @@ if ! type cmake-format 2> /dev/null ; then
 fi
 
 find . -type d \( \
+    -path ./cmake/Modules -prune -o \
     -path ./\*build\* -o \
     -path ./release -o \
     -path ./deps/jansson -o \
