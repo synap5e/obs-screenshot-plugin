@@ -2,6 +2,7 @@
 #include <wininet.h>
 #include <obs-module.h>
 #include <util/threading.h>
+#include <obs-hotkey.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
