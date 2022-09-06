@@ -18,7 +18,16 @@ include(cmake/ObsPluginHelpers.cmake)
 find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil avformat swscale swresample)
 include_directories(${FFMPEG_INCLUDE_DIRS})
 
-target_link_libraries(obs-screenshot-filter OBS::libobs OBS:ffmpeg wininet.lib ${FFMPEG_LIBRARIES})
+target_link_libraries(obs-screenshot-filter PRIVATE OBS::libobs wininet)
+
+if(MSVC)
+  target_include_directories(obs-screenshot-filter
+                             PRIVATE ${CMAKE_SOURCE_DIR}/../obs-studio/deps/w32-pthreads/)
+  target_link_libraries(obs-screenshot-filter PRIVATE OBS::w32-pthreads)
+endif()
+
+target_link_libraries(obs-screenshot-filter PRIVATE FFmpeg::avcodec FFmpeg::avutil FFmpeg::avformat
+                                                    FFmpeg::swscale FFmpeg::swresample)
 
 # --- Windows-specific build settings and tasks ---
 if(OS_WINDOWS)
