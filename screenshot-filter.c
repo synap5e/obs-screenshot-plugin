@@ -1,7 +1,7 @@
 #include <windows.h>
 #include <wininet.h>
 #include <obs-module.h>
-#include <obs-internal.h>
+#include <util/threading.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
