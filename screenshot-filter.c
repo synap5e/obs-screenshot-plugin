@@ -224,8 +224,8 @@ static obs_properties_t *screenshot_filter_properties(void *data)
 	obs_property_set_modified_callback(p_enable_timer,
 					   is_timer_enable_modified);
 
-	obs_properties_add_float(props, SETTING_INTERVAL,
-					"Interval (seconds)", 0.25, 86400, 0.25);
+	obs_properties_add_float(props, SETTING_INTERVAL, "Interval (seconds)",
+				 0.25, 86400, 0.25);
 
 	obs_properties_add_bool(props, SETTING_RAW, "Raw image");
 
@@ -332,13 +332,10 @@ static void make_hotkey(struct screenshot_filter_data *filter)
 		 filter_name, parent_name);
 
 	filter->capture_hotkey_id = obs_hotkey_register_frontend(
-		hotkey_name, hotkey_description, capture_key_callback,
-		filter);
+		hotkey_name, hotkey_description, capture_key_callback, filter);
 
-	info("Registered hotkey on %s: %s %s, key=%d", filter_name,
-		hotkey_name, hotkey_description,
-		filter->capture_hotkey_id);
-	
+	info("Registered hotkey on %s: %s %s, key=%d", filter_name, hotkey_name,
+	     hotkey_description, filter->capture_hotkey_id);
 }
 
 static void screenshot_filter_load(void *data, obs_data_t *settings)
@@ -498,7 +495,8 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 	UNUSED_PARAMETER(effect);
 
 	if (!filter->capture_hotkey_id) {
-		info("Registering hotkey on filter render for filter %p", filter);
+		info("Registering hotkey on filter render for filter %p",
+		     filter);
 		make_hotkey(filter);
 	}
 
@@ -786,7 +784,6 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 		if (strlen(port_str) == 0)
 			return false;
 		port = atoi(port_str);
-
 	}
 
 	char host[128] = {0};
