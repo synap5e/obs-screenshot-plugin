@@ -619,6 +619,7 @@ static bool write_image(const char *destination, uint8_t *image_data_ptr,
 		       image_data_ptr + y * image_data_linesize, width * 4);
 	frame->pts = 1;
 
+#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(57, 40, 101)
 	int got_output = 0;
 	ret = avcodec_encode_video2(codec_context, &pkt, frame, &got_output);
 	if (ret == 0 && got_output) {
@@ -627,6 +628,20 @@ static bool write_image(const char *destination, uint8_t *image_data_ptr,
 				     destination_type);
 		av_free_packet(&pkt);
 	}
+#else
+	ret = avcodec_send_frame(codec_context, frame);
+	if (ret < 0)
+		goto err_av_image_alloc;
+	ret = avcodec_receive_packet(codec_context, &pkt);
+	if (ret < 0 || ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+		goto err_av_image_alloc;
+	} else {
+		success = write_data(destination, pkt.data, pkt.size,
+				     "image/png", width, height,
+				     destination_type);
+		av_packet_unref(&pkt);
+	}
+#endif
 
 	av_freep(frame->data);
 
