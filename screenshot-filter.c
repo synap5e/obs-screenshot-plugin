@@ -65,7 +65,7 @@ struct screenshot_filter_data {
 	uint32_t width;
 	uint32_t height;
 	gs_texrender_t *texrender;
-	gs_texture_t *staging_texture;
+	gs_stagesurf_t *staging_texture;
 
 	uint8_t *data;
 	uint32_t linesize;
