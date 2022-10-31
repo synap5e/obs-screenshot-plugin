@@ -38,3 +38,14 @@ Note that the linesize and width may differ (e.g. `linesize%32=0`, width not con
 ## Timer
 
 In this mode, you can select for the image to be written automatically on a timer (between 250ms and 60s) in addition to on a hotkey.
+
+# Development
+
+## Building/Running Locally
+This plugin was developed "in-tree" i.e. checking the project out into the plugins directory of a correctly-building OBS. Out-of-tree builiding should also be possible.
+
+## Github Actions + Versioning
+The plugin will build & publish releases automatically. Big thanks to @wkpark for this work.
+
+For incrementing version numbers, remember to update `buildspec.json` to a new version, then tag HEAD with the same version.
+
