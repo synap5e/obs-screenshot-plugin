@@ -49,3 +49,8 @@ The plugin will build & publish releases automatically. Big thanks to @wkpark fo
 
 For incrementing version numbers, remember to update `buildspec.json` to a new version, then tag HEAD with the same version.
 
+
+
+
+
+
