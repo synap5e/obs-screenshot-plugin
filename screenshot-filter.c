@@ -1,13 +1,23 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include <windows.h>
 #include <wininet.h>
 #include <obs-module.h>
-#include <util/threading.h>
 #include <obs-hotkey.h>
+#include <util/darray.h>
+#include <util/platform.h>
 
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/imgutils.h>
-#include <libswscale/swscale.h>
+// PNG encoding is done with stb_image_write instead of FFmpeg: linking against
+// OBS's FFmpeg DLLs ties the plugin to one OBS major version (avcodec-60/61/62).
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#define STBI_WRITE_NO_STDIO
+#define STBIW_MALLOC(sz) bmalloc(sz)
+#define STBIW_REALLOC(p, newsz) brealloc(p, newsz)
+#define STBIW_FREE(p) bfree(p)
+#include "stb_image_write.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("screenshot-filter", "en-US")
@@ -77,7 +87,7 @@ struct screenshot_filter_data {
 	HANDLE shmem;
 
 	HANDLE mutex;
-	bool exit;
+	volatile bool exit;
 	bool exited;
 };
 
@@ -87,40 +97,46 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 		WaitForSingleObject(filter->mutex, INFINITE);
 		// copy all props & data inside the mutex, then do the processing/write/put outside of the mutex
 		uint8_t *data = NULL;
-		char *destination = filter->destination;
+		char *destination = NULL;
 		int destination_type = filter->destination_type;
 		uint32_t width = filter->width;
 		uint32_t height = filter->height;
 		uint32_t linesize = filter->linesize;
 		bool raw = filter->raw;
-		if (filter->ready) {
+		bool ready = filter->ready && width > 10 && height > 10;
+		filter->ready = false;
+
+		if (ready && destination_type == SETTING_DESTINATION_SHMEM_ID) {
+			// write the mapping while holding the mutex: tick may
+			// recreate it with a different size at any time
+			size_t frame_size = (size_t)linesize * height;
+			if (filter->shmem &&
+			    frame_size + 16 <= filter->shmem_size) {
+				uint32_t *buf = (uint32_t *)MapViewOfFile(
+					filter->shmem, FILE_MAP_ALL_ACCESS, 0,
+					0, filter->shmem_size);
+				if (buf) {
+					buf[0] = width;
+					buf[1] = height;
+					buf[2] = linesize;
+					buf[3] = filter->index;
+					memcpy(&buf[4], filter->data,
+					       frame_size);
+					UnmapViewOfFile(buf);
+				}
+			}
+			filter->index += 1;
+		} else if (ready && filter->destination &&
+			   *filter->destination) {
 			data = bzalloc(linesize * height);
 			memcpy(data, filter->data, linesize * height);
-			filter->ready = false;
+			// update() may replace the string while we write
+			destination = bstrdup(filter->destination);
 		}
 		ReleaseMutex(filter->mutex);
 
-		if (data && width > 10 && height > 10) {
-			if (destination_type == SETTING_DESTINATION_SHMEM_ID) {
-				if (filter->shmem) {
-					uint32_t *buf =
-						(uint32_t *)MapViewOfFile(
-							filter->shmem,
-							FILE_MAP_ALL_ACCESS, 0,
-							0, filter->shmem_size);
-
-					if (buf) {
-						buf[0] = width;
-						buf[1] = height;
-						buf[2] = linesize;
-						buf[3] = filter->index;
-						memcpy(&buf[4], data,
-						       linesize * height);
-					}
-
-					UnmapViewOfFile(buf);
-				}
-			} else if (raw)
+		if (data) {
+			if (raw)
 				write_data(destination, data, linesize * height,
 					   "image/rgba32", width, height,
 					   destination_type);
@@ -129,6 +145,7 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 					    height, destination_type);
 			filter->index += 1;
 			bfree(data);
+			bfree(destination);
 		}
 		Sleep(200);
 	}
@@ -260,15 +277,20 @@ static void screenshot_filter_update(void *data, obs_data_t *settings)
 	WaitForSingleObject(filter->mutex, INFINITE);
 
 	filter->destination_type = type;
+	// keep our own copy: strings from settings can be freed when the
+	// user edits the properties, while the writer thread still uses them
+	const char *destination = NULL;
 	if (type == SETTING_DESTINATION_PATH_ID) {
-		filter->destination = (char *)path;
+		destination = path;
 	} else if (type == SETTING_DESTINATION_URL_ID) {
-		filter->destination = (char *)url;
+		destination = url;
 	} else if (type == SETTING_DESTINATION_SHMEM_ID) {
-		filter->destination = (char *)shmem_name;
+		destination = shmem_name;
 	} else if (type == SETTING_DESTINATION_FOLDER_ID) {
-		filter->destination = (char *)folder_path;
+		destination = folder_path;
 	}
+	bfree(filter->destination);
+	filter->destination = destination ? bstrdup(destination) : NULL;
 	info("Set destination=%s, %d", filter->destination,
 	     filter->destination_type);
 
@@ -294,18 +316,34 @@ static void *screenshot_filter_create(obs_data_t *settings,
 	filter->texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	obs_leave_graphics();
 
-	filter->image_writer_thread = CreateThread(NULL, 0, write_images_thread,
-						   (LPVOID)filter, 0, NULL);
-	if (!filter->image_writer_thread) {
-		//error("image_writer_thread: Failed to create thread: %d", GetLastError());
-		return NULL;
-	}
-	info("Created image writer thread %d", filter);
-
 	filter->interval = 2.0f;
 	filter->shmem_name[0] = '\0';
 
+	// the writer thread waits on the mutex right away, so create it first
 	filter->mutex = CreateMutexA(NULL, FALSE, NULL);
+	if (!filter->mutex) {
+		warn("Failed to create mutex: %lu", GetLastError());
+		obs_enter_graphics();
+		gs_texrender_destroy(filter->texrender);
+		obs_leave_graphics();
+		bfree(filter);
+		return NULL;
+	}
+
+	filter->image_writer_thread = CreateThread(
+		NULL, 0, (LPTHREAD_START_ROUTINE)write_images_thread,
+		(LPVOID)filter, 0, NULL);
+	if (!filter->image_writer_thread) {
+		warn("Failed to create image writer thread: %lu",
+		     GetLastError());
+		obs_enter_graphics();
+		gs_texrender_destroy(filter->texrender);
+		obs_leave_graphics();
+		CloseHandle(filter->mutex);
+		bfree(filter);
+		return NULL;
+	}
+	info("Created image writer thread for filter %p", filter);
 
 	obs_source_update(context, settings);
 
@@ -338,22 +376,27 @@ static void make_hotkey(struct screenshot_filter_data *filter)
 	filter->capture_hotkey_id = obs_hotkey_register_frontend(
 		hotkey_name, hotkey_description, capture_key_callback, filter);
 
-	info("Registered hotkey on %s: %s %s, key=%d", filter_name, hotkey_name,
-	     hotkey_description, filter->capture_hotkey_id);
+	info("Registered hotkey on %s: %s %s, key=%llu", filter_name, hotkey_name,
+	     hotkey_description,
+	     (unsigned long long)filter->capture_hotkey_id);
 }
 
 static void screenshot_filter_load(void *data, obs_data_t *settings)
 {
 	struct screenshot_filter_data *filter = data;
 
-	info("Registering hotkey on filter load for filter %p", filter);
-	make_hotkey(filter);
+	// render may already have registered it
+	if (!filter->capture_hotkey_id) {
+		info("Registering hotkey on filter load for filter %p",
+		     filter);
+		make_hotkey(filter);
+	}
 
 	obs_data_array_t *hotkeys =
 		obs_data_get_array(settings, "capture_hotkey");
 	if (filter->capture_hotkey_id && obs_data_array_count(hotkeys)) {
-		info("Restoring hotkey settings for %d",
-		     filter->capture_hotkey_id);
+		info("Restoring hotkey settings for %llu",
+		     (unsigned long long)filter->capture_hotkey_id);
 		obs_hotkey_load(filter->capture_hotkey_id, hotkeys);
 	}
 	obs_data_array_release(hotkeys);
@@ -363,32 +406,37 @@ static void screenshot_filter_destroy(void *data)
 {
 	struct screenshot_filter_data *filter = data;
 
-	filter->exit = true;
-	for (int _ = 0; _ < 500 && !filter->exited; ++_) {
-		Sleep(10);
-	}
-	if (filter->exited) {
-		info("Image writer thread stopped");
-	} else {
-		// This is not good... Hopefully the thread has crashed, otherwise it's going to be working with filter after it has been free'd
-		warn("Image writer thread failed to stop");
+	// the hotkey callback must not run on a freed filter
+	if (filter->capture_hotkey_id) {
+		obs_hotkey_unregister(filter->capture_hotkey_id);
+		filter->capture_hotkey_id = 0;
 	}
 
-	WaitForSingleObject(filter->mutex, INFINITE);
+	// Wait for the writer thread to finish for real: freeing the filter
+	// while it is still encoding or uploading crashes OBS. Uploads are
+	// bounded by the WinINet timeouts set in put_data.
+	filter->exit = true;
+	WaitForSingleObject(filter->image_writer_thread, INFINITE);
+	CloseHandle(filter->image_writer_thread);
+	info("Image writer thread stopped");
+
+	// same lock order as tick and render: graphics first, then mutex
 	obs_enter_graphics();
+	WaitForSingleObject(filter->mutex, INFINITE);
 	gs_texrender_destroy(filter->texrender);
 	if (filter->staging_texture) {
 		gs_stagesurface_destroy(filter->staging_texture);
 	}
-	obs_leave_graphics();
 	if (filter->data) {
 		bfree(filter->data);
 	}
+	bfree(filter->destination);
 
 	if (filter->shmem) {
 		CloseHandle(filter->shmem);
 	}
 	ReleaseMutex(filter->mutex);
+	obs_leave_graphics();
 	CloseHandle(filter->mutex);
 
 	bfree(filter);
@@ -397,6 +445,9 @@ static void screenshot_filter_destroy(void *data)
 static void screenshot_filter_remove(void *data, obs_source_t *context)
 {
 	struct screenshot_filter_data *filter = data;
+	// libobs calls filter_remove even if create() failed and returned NULL
+	if (!filter)
+		return;
 	if (filter->capture_hotkey_id) {
 		obs_hotkey_unregister(filter->capture_hotkey_id);
 		filter->capture_hotkey_id = 0;
@@ -409,75 +460,86 @@ static void screenshot_filter_tick(void *data, float t)
 
 	obs_source_t *target = obs_filter_get_target(filter->context);
 
-	if (!target) {
-		filter->width = 0;
-		filter->height = 0;
+	uint32_t width = target ? obs_source_get_base_width(target) : 0;
+	uint32_t height = target ? obs_source_get_base_height(target) : 0;
+
+	// width/height are only written here, on the graphics thread, so they
+	// can be compared before locking. Lock order everywhere: graphics
+	// context first, then the filter mutex (render runs inside graphics).
+	bool update = width != filter->width || height != filter->height;
+	if (update)
+		obs_enter_graphics();
+	WaitForSingleObject(filter->mutex, INFINITE);
+	if (update) {
+		filter->width = width;
+		filter->height = height;
 
 		if (filter->staging_texture) {
-			obs_enter_graphics();
 			gs_stagesurface_destroy(filter->staging_texture);
-			obs_leave_graphics();
 			filter->staging_texture = NULL;
 		}
+		if (width && height)
+			filter->staging_texture = gs_stagesurface_create(
+				width, height, GS_RGBA);
+
 		if (filter->data) {
 			bfree(filter->data);
 			filter->data = NULL;
 		}
-		filter->ready = false;
-
-		return;
-	}
-
-	uint32_t width = obs_source_get_base_width(target);
-	uint32_t height = obs_source_get_base_height(target);
-
-	WaitForSingleObject(filter->mutex, INFINITE);
-	bool update = false;
-	if (width != filter->width || height != filter->height) {
-		update = true;
-
-		filter->width = width;
-		filter->height = height;
-
-		obs_enter_graphics();
+		// A source can report 0x0 (e.g. a media source restarting);
+		// OBS 30+ aborts on bmalloc(0), so only allocate for a real size.
+		// only allocate when the GPU accepted the size (<= 16384)
 		if (filter->staging_texture) {
-			gs_stagesurface_destroy(filter->staging_texture);
+			filter->data = bzalloc((size_t)width * height * 4);
+			info("Created Staging texture %u by %u: %p", width,
+			     height, filter->staging_texture);
+		} else {
+			info("Unsupported source size %ux%u, capture paused",
+			     width, height);
 		}
-		filter->staging_texture = gs_stagesurface_create(
-			filter->width, filter->height, GS_RGBA);
-		obs_leave_graphics();
-		info("Created Staging texture %d by %d: %x", width, height,
-		     filter->staging_texture);
-
-		if (filter->data) {
-			bfree(filter->data);
-		}
-		filter->data = bzalloc((width + 32) * height * 4);
 		filter->ready = false;
 		filter->capture = false;
 		filter->since_last = 0.0f;
 	}
 
+	if (!width || !height || !filter->staging_texture) {
+		ReleaseMutex(filter->mutex);
+		if (update)
+			obs_leave_graphics();
+		return;
+	}
+
 	if (filter->destination_type == SETTING_DESTINATION_SHMEM_ID &&
 	    filter->destination) {
+		// shmem_name keeps at most sizeof - 1 bytes, compare as many
 		if (update || strncmp(filter->destination, filter->shmem_name,
-				      sizeof(filter->shmem_name))) {
+				      sizeof(filter->shmem_name) - 1)) {
 			info("update shmem");
 			if (filter->shmem) {
-				info("Closing shmem \"%s\": %x",
+				info("Closing shmem \"%s\": %p",
 				     filter->shmem_name, filter->shmem);
 				CloseHandle(filter->shmem);
 			}
-			filter->shmem_size = 12 + (width + 32) * height * 4;
+			filter->shmem_size = 16 + width * height * 4;
 			wchar_t name[256];
-			mbstowcs(name, filter->destination, sizeof(name));
-			filter->shmem = CreateFileMapping(INVALID_HANDLE_VALUE,
-							  NULL, PAGE_READWRITE,
-							  0, filter->shmem_size,
-							  name);
+			filter->shmem = NULL;
+			if (MultiByteToWideChar(CP_UTF8, 0, filter->destination,
+						-1, name,
+						(int)(sizeof(name) /
+						      sizeof(name[0])))) {
+				filter->shmem = CreateFileMappingW(
+					INVALID_HANDLE_VALUE, NULL,
+					PAGE_READWRITE, 0, filter->shmem_size,
+					name);
+			} else {
+				warn("Shared memory name is too long: \"%s\"",
+				     filter->destination);
+			}
 			strncpy(filter->shmem_name, filter->destination,
-				sizeof(filter->shmem_name));
-			info("Created shmem \"%s\": %x", filter->shmem_name,
+				sizeof(filter->shmem_name) - 1);
+			filter->shmem_name[sizeof(filter->shmem_name) - 1] =
+				'\0';
+			info("Created shmem \"%s\": %p", filter->shmem_name,
 			     filter->shmem);
 		}
 	}
@@ -491,6 +553,8 @@ static void screenshot_filter_tick(void *data, float t)
 	}
 
 	ReleaseMutex(filter->mutex);
+	if (update)
+		obs_leave_graphics();
 }
 
 static void screenshot_filter_render(void *data, gs_effect_t *effect)
@@ -498,16 +562,19 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 	struct screenshot_filter_data *filter = data;
 	UNUSED_PARAMETER(effect);
 
-	if (!filter->capture_hotkey_id) {
+	obs_source_t *target = obs_filter_get_target(filter->context);
+	obs_source_t *parent = obs_filter_get_parent(filter->context);
+
+	// no parent: the filter is being removed, don't register a hotkey
+	// that nothing would unregister
+	if (!filter->capture_hotkey_id && parent) {
 		info("Registering hotkey on filter render for filter %p",
 		     filter);
 		make_hotkey(filter);
 	}
 
-	obs_source_t *target = obs_filter_get_target(filter->context);
-	obs_source_t *parent = obs_filter_get_parent(filter->context);
-
-	if (!parent || !filter->width || !filter->height || !filter->capture) {
+	if (!parent || !filter->width || !filter->height || !filter->capture ||
+	    !filter->staging_texture || !filter->data) {
 		obs_source_skip_video_filter(filter->context);
 		return;
 	}
@@ -551,8 +618,14 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 		WaitForSingleObject(filter->mutex, INFINITE);
 		if (gs_stagesurface_map(filter->staging_texture, &data,
 					&linesize)) {
-			memcpy(filter->data, data, linesize * filter->height);
-			filter->linesize = linesize;
+			// The staging row pitch is driver-aligned and can be
+			// larger than width * 4, so copy row by row into a
+			// tightly packed buffer.
+			uint32_t row_size = filter->width * 4;
+			for (uint32_t y = 0; y < filter->height; y++)
+				memcpy(filter->data + y * row_size,
+				       data + y * linesize, row_size);
+			filter->linesize = row_size;
 			filter->ready = true;
 
 			gs_stagesurface_unmap(filter->staging_texture);
@@ -569,107 +642,35 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 	}
 }
 
-// code adapted from https://github.com/obsproject/obs-studio/pull/1269 and https://stackoverflow.com/a/12563019
+static void png_write_callback(void *context, void *data, int size)
+{
+	struct darray *buf = context;
+	darray_push_back_array(sizeof(uint8_t), buf, data, size);
+}
+
 static bool write_image(const char *destination, uint8_t *image_data_ptr,
 			uint32_t image_data_linesize, uint32_t width,
 			uint32_t height, int destination_type)
 {
-	bool success = false;
-
-	int ret;
-	AVFrame *frame;
-	AVPacket pkt;
-
 	if (image_data_ptr == NULL)
-		goto err_no_image_data;
+		return false;
 
-	const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
-	if (codec == NULL)
-		goto err_png_codec_not_found;
+	struct darray png;
+	darray_init(&png);
 
-	AVCodecContext *codec_context = avcodec_alloc_context3(codec);
-	if (codec_context == NULL)
-		goto err_png_encoder_context_alloc;
-
-	codec_context->bit_rate = 400000;
-	codec_context->width = width;
-	codec_context->height = height;
-	codec_context->time_base = (AVRational){1, 25};
-	codec_context->pix_fmt = AV_PIX_FMT_RGBA;
-
-	if (avcodec_open2(codec_context, codec, NULL) != 0)
-		goto err_png_encoder_open;
-
-	frame = av_frame_alloc();
-	if (frame == NULL)
-		goto err_av_frame_alloc;
-
-	frame->format = codec_context->pix_fmt;
-	frame->width = width;
-	frame->height = height;
-
-	ret = av_image_alloc(frame->data, frame->linesize, codec_context->width,
-			     codec_context->height, codec_context->pix_fmt, 4);
-	if (ret < 0)
-		goto err_av_image_alloc;
-
-	av_init_packet(&pkt);
-	pkt.data = NULL;
-	pkt.size = 0;
-
-	for (int y = 0; y < height; ++y)
-		memcpy(frame->data[0] + y * width * 4,
-		       image_data_ptr + y * image_data_linesize, width * 4);
-	frame->pts = 1;
-
-#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(57, 40, 101)
-	int got_output = 0;
-	ret = avcodec_encode_video2(codec_context, &pkt, frame, &got_output);
-	if (ret == 0 && got_output) {
-		success = write_data(destination, pkt.data, pkt.size,
+	bool success = false;
+	if (stbi_write_png_to_func(png_write_callback, &png, (int)width,
+				   (int)height, 4, image_data_ptr,
+				   (int)image_data_linesize) &&
+	    png.num) {
+		success = write_data(destination, png.array, png.num,
 				     "image/png", width, height,
 				     destination_type);
-		av_free_packet(&pkt);
-	}
-#else
-	ret = avcodec_send_frame(codec_context, frame);
-	if (ret < 0)
-		goto err_av_image_alloc;
-	ret = avcodec_receive_packet(codec_context, &pkt);
-	if (ret < 0 || ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-		goto err_av_image_alloc;
 	} else {
-		success = write_data(destination, pkt.data, pkt.size,
-				     "image/png", width, height,
-				     destination_type);
-		av_packet_unref(&pkt);
+		warn("Failed to encode PNG (%ux%u)", width, height);
 	}
-#endif
 
-	av_freep(frame->data);
-
-err_av_image_alloc:
-	// Failed allocating image data buffer
-	av_frame_free(&frame);
-	frame = NULL;
-
-err_av_frame_alloc:
-	// Failed allocating frame
-	avcodec_close(codec_context);
-
-err_png_encoder_open:
-	// Failed opening PNG encoder
-	avcodec_free_context(&codec_context);
-	codec_context = NULL;
-
-err_png_encoder_context_alloc:
-	// failed allocating PNG encoder context
-	// no need to free AVCodec* codec
-err_png_codec_not_found:
-	// PNG encoder not found
-err_no_image_data:
-	// image_data_ptr == NULL
-
+	darray_free(&png);
 	return success;
 }
 
@@ -680,7 +681,7 @@ static bool write_data(const char *destination, uint8_t *data, size_t len,
 	bool success = false;
 
 	if (destination_type == SETTING_DESTINATION_PATH_ID) {
-		FILE *of = fopen(destination, "wb");
+		FILE *of = os_fopen(destination, "wb");
 
 		if (of != NULL) {
 			//info("write %s (%d bytes)", destination, len);
@@ -693,20 +694,23 @@ static bool write_data(const char *destination, uint8_t *data, size_t len,
 		if (strstr(destination, "http://") != NULL ||
 		    strstr(destination, "https://") != NULL) {
 			//info("PUT %s (%d bytes)", destination, len);
-			success = put_data(destination, data, len, content_type,
+			success = put_data((char *)destination, data, len, content_type,
 					   width, height);
 		}
 	}
 	if (destination_type == SETTING_DESTINATION_FOLDER_ID) {
-		FILE *of = fopen(destination, "rb");
+		FILE *of = os_fopen(destination, "rb");
 
 		if (of != NULL) {
 			fclose(of);
 		} else {
 			time_t nowunixtime = time(NULL);
 			struct tm *nowtime = localtime(&nowunixtime);
+			if (!nowtime)
+				return false;
 			char _file_destination[260];
 			char file_destination[260];
+			bool png = !strcmp(content_type, "image/png");
 
 			int dest_length = snprintf(
 				_file_destination, 259,
@@ -720,33 +724,31 @@ static bool write_data(const char *destination, uint8_t *data, size_t len,
 				if (repeat_count > 5) {
 					break;
 				}
-				dest_length = snprintf(file_destination, 259,
-						       "%s", _file_destination);
-				if (repeat_count > 0) {
+				// name.png / name_N.png, raw: name / name_N.raw
+				if (repeat_count > 0)
 					dest_length = snprintf(
 						file_destination, 259,
-						"%s_%d.raw", _file_destination,
-						repeat_count);
-				}
+						"%s_%d%s", _file_destination,
+						repeat_count,
+						png ? ".png" : ".raw");
+				else
+					dest_length = snprintf(
+						file_destination, 259, "%s%s",
+						_file_destination,
+						png ? ".png" : "");
 				repeat_count++;
 
-				if (!strcmp(content_type, "image/png")) {
-					dest_length = snprintf(
-						file_destination, 259, "%s.png",
-						file_destination);
-				}
-
-				if (dest_length <= 0) {
+				if (dest_length <= 0 || dest_length >= 259) {
 					break;
 				}
 
-				of = fopen(file_destination, "rb");
+				of = os_fopen(file_destination, "rb");
 				if (of != NULL) {
 					fclose(of);
 					continue;
 				}
 
-				of = fopen(file_destination, "wb");
+				of = os_fopen(file_destination, "wb");
 				if (of == NULL) {
 					continue;
 				} else {
@@ -810,13 +812,26 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 	char *location = location_start;
 
 	HINTERNET hIntrn = InternetOpenA(
-		"OBS Screenshot Plugin/1.2.1",
+		"OBS Screenshot Plugin/1.6.0",
 		INTERNET_OPEN_TYPE_PRECONFIG_WITH_NO_AUTOPROXY, NULL, NULL, 0);
 	if (!hIntrn)
 		goto err_internet_open;
 
+	// bound how long an unreachable server can block the writer thread
+	// (destroy waits for it)
+	DWORD timeout_ms = 5000;
+	InternetSetOptionA(hIntrn, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout_ms,
+			   sizeof(timeout_ms));
+	InternetSetOptionA(hIntrn, INTERNET_OPTION_SEND_TIMEOUT, &timeout_ms,
+			   sizeof(timeout_ms));
+	InternetSetOptionA(hIntrn, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout_ms,
+			   sizeof(timeout_ms));
+	DWORD retries = 1;
+	InternetSetOptionA(hIntrn, INTERNET_OPTION_CONNECT_RETRIES, &retries,
+			   sizeof(retries));
+
 	HINTERNET hConn = InternetConnectA(hIntrn, host, port, NULL, NULL,
-					   INTERNET_SERVICE_HTTP, 0, NULL);
+					   INTERNET_SERVICE_HTTP, 0, 0);
 	if (!hConn)
 		goto err_internet_connect;
 
@@ -826,24 +841,21 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 				   INTERNET_FLAG_NO_UI | INTERNET_FLAG_RELOAD;
 
 	HINTERNET hReq = HttpOpenRequestA(hConn, "PUT", location, "HTTP/1.1",
-					  NULL, NULL, dwOpenRequestFlags, NULL);
+					  NULL, NULL, dwOpenRequestFlags, 0);
 	if (!hReq)
 		goto err_http_open_request;
 
-	char header[1024] = {0};
-	snprintf(header, sizeof(header), "%sContent-Type: %s\r\n", header,
-		 content_type);
-	snprintf(header, sizeof(header), "%sImage-Width: %d\r\n", header,
-		 width);
-	snprintf(header, sizeof(header), "%sImage-Height: %d\r\n", header,
-		 height);
+	char header[1024];
+	snprintf(header, sizeof(header),
+		 "Content-Type: %s\r\nImage-Width: %d\r\nImage-Height: %d\r\n",
+		 content_type, width, height);
 
-	if (HttpSendRequestA(hReq, header, strnlen(header, sizeof(header)), buf,
-			     len)) {
+	if (HttpSendRequestA(hReq, header, (DWORD)strlen(header), buf,
+			     (DWORD)len)) {
 		success = true;
 		info("Uploaded file to %s:%d%s", host, port, location);
 	} else {
-		warn("Failed to upload file to http://%s:%d%s - %d", host, port,
+		warn("Failed to upload file to http://%s:%d%s - %lu", host, port,
 		     location, GetLastError());
 	}
 
@@ -866,8 +878,8 @@ static void capture_key_callback(void *data, obs_hotkey_id id,
 {
 	struct screenshot_filter_data *filter = data;
 	const char *filter_name = obs_source_get_name(filter->context);
-	info("Got capture_key pressed for %s, id: %d, key: %s, pressed: %d",
-	     filter_name, id, obs_hotkey_get_name(key), pressed);
+	info("Got capture_key pressed for %s, id: %llu, key: %s, pressed: %d",
+	     filter_name, (unsigned long long)id, obs_hotkey_get_name(key), pressed);
 
 	if (id != filter->capture_hotkey_id || !pressed)
 		return;
