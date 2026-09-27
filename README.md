@@ -2,6 +2,9 @@
 
 This [OBS Studio](https://obsproject.com) filter saves images of the attatched source. Images can be RGBA32 .png files or raw bytes. Images can be saved to a local file, local directory, PUT to a web server, or written to a named shared memory. The plugin can be triggered on a timer or on a hotkey.
 
+**OBS 30 and newer**
+Version 1.6.0 no longer depends on OBS's FFmpeg DLLs (PNG encoding uses the bundled `stb_image_write.h`), so it is not tied to the FFmpeg version shipped with a particular OBS release. It is built against the OBS 31 headers and tested on OBS 32.2.2. The 1.5.2 release links `avcodec-59.dll`/`avutil-57.dll`, which only ship with OBS 28, so on newer OBS versions the DLL fails to load and the filter silently disappears from the filter list.
+
 **Note for users updating from version 1.2.2 and lower**
 Version 1.3 changes the default behaviour from using a timer to using hotkeys for non-shmem screenshot filters. If you are using file/HTTP destinations on a timer, you will need to "Enable timer" on the filter.
 Named Shared Memory destinations can only use timer mode, and will continue to use the timer with no changes required.

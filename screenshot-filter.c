@@ -1,13 +1,22 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include <windows.h>
 #include <wininet.h>
 #include <obs-module.h>
-#include <util/threading.h>
 #include <obs-hotkey.h>
+#include <util/darray.h>
 
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/imgutils.h>
-#include <libswscale/swscale.h>
+// PNG encoding is done with stb_image_write instead of FFmpeg: linking against
+// OBS's FFmpeg DLLs ties the plugin to one OBS major version (avcodec-60/61/62).
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#define STBI_WRITE_NO_STDIO
+#define STBIW_MALLOC(sz) bmalloc(sz)
+#define STBIW_REALLOC(p, newsz) brealloc(p, newsz)
+#define STBIW_FREE(p) bfree(p)
+#include "stb_image_write.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("screenshot-filter", "en-US")
@@ -93,34 +102,37 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 		uint32_t height = filter->height;
 		uint32_t linesize = filter->linesize;
 		bool raw = filter->raw;
-		if (filter->ready) {
+		bool ready = filter->ready && width > 10 && height > 10;
+		filter->ready = false;
+
+		if (ready && destination_type == SETTING_DESTINATION_SHMEM_ID) {
+			// write the mapping while holding the mutex: tick may
+			// recreate it with a different size at any time
+			size_t frame_size = (size_t)linesize * height;
+			if (filter->shmem &&
+			    frame_size + 16 <= filter->shmem_size) {
+				uint32_t *buf = (uint32_t *)MapViewOfFile(
+					filter->shmem, FILE_MAP_ALL_ACCESS, 0,
+					0, filter->shmem_size);
+				if (buf) {
+					buf[0] = width;
+					buf[1] = height;
+					buf[2] = linesize;
+					buf[3] = filter->index;
+					memcpy(&buf[4], filter->data,
+					       frame_size);
+					UnmapViewOfFile(buf);
+				}
+			}
+			filter->index += 1;
+		} else if (ready) {
 			data = bzalloc(linesize * height);
 			memcpy(data, filter->data, linesize * height);
-			filter->ready = false;
 		}
 		ReleaseMutex(filter->mutex);
 
-		if (data && width > 10 && height > 10) {
-			if (destination_type == SETTING_DESTINATION_SHMEM_ID) {
-				if (filter->shmem) {
-					uint32_t *buf =
-						(uint32_t *)MapViewOfFile(
-							filter->shmem,
-							FILE_MAP_ALL_ACCESS, 0,
-							0, filter->shmem_size);
-
-					if (buf) {
-						buf[0] = width;
-						buf[1] = height;
-						buf[2] = linesize;
-						buf[3] = filter->index;
-						memcpy(&buf[4], data,
-						       linesize * height);
-					}
-
-					UnmapViewOfFile(buf);
-				}
-			} else if (raw)
+		if (data) {
+			if (raw)
 				write_data(destination, data, linesize * height,
 					   "image/rgba32", width, height,
 					   destination_type);
@@ -294,18 +306,34 @@ static void *screenshot_filter_create(obs_data_t *settings,
 	filter->texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	obs_leave_graphics();
 
-	filter->image_writer_thread = CreateThread(NULL, 0, write_images_thread,
-						   (LPVOID)filter, 0, NULL);
-	if (!filter->image_writer_thread) {
-		//error("image_writer_thread: Failed to create thread: %d", GetLastError());
-		return NULL;
-	}
-	info("Created image writer thread %d", filter);
-
 	filter->interval = 2.0f;
 	filter->shmem_name[0] = '\0';
 
+	// the writer thread waits on the mutex right away, so create it first
 	filter->mutex = CreateMutexA(NULL, FALSE, NULL);
+	if (!filter->mutex) {
+		warn("Failed to create mutex: %lu", GetLastError());
+		obs_enter_graphics();
+		gs_texrender_destroy(filter->texrender);
+		obs_leave_graphics();
+		bfree(filter);
+		return NULL;
+	}
+
+	filter->image_writer_thread = CreateThread(
+		NULL, 0, (LPTHREAD_START_ROUTINE)write_images_thread,
+		(LPVOID)filter, 0, NULL);
+	if (!filter->image_writer_thread) {
+		warn("Failed to create image writer thread: %lu",
+		     GetLastError());
+		obs_enter_graphics();
+		gs_texrender_destroy(filter->texrender);
+		obs_leave_graphics();
+		CloseHandle(filter->mutex);
+		bfree(filter);
+		return NULL;
+	}
+	info("Created image writer thread for filter %p", filter);
 
 	obs_source_update(context, settings);
 
@@ -338,8 +366,9 @@ static void make_hotkey(struct screenshot_filter_data *filter)
 	filter->capture_hotkey_id = obs_hotkey_register_frontend(
 		hotkey_name, hotkey_description, capture_key_callback, filter);
 
-	info("Registered hotkey on %s: %s %s, key=%d", filter_name, hotkey_name,
-	     hotkey_description, filter->capture_hotkey_id);
+	info("Registered hotkey on %s: %s %s, key=%llu", filter_name, hotkey_name,
+	     hotkey_description,
+	     (unsigned long long)filter->capture_hotkey_id);
 }
 
 static void screenshot_filter_load(void *data, obs_data_t *settings)
@@ -352,8 +381,8 @@ static void screenshot_filter_load(void *data, obs_data_t *settings)
 	obs_data_array_t *hotkeys =
 		obs_data_get_array(settings, "capture_hotkey");
 	if (filter->capture_hotkey_id && obs_data_array_count(hotkeys)) {
-		info("Restoring hotkey settings for %d",
-		     filter->capture_hotkey_id);
+		info("Restoring hotkey settings for %llu",
+		     (unsigned long long)filter->capture_hotkey_id);
 		obs_hotkey_load(filter->capture_hotkey_id, hotkeys);
 	}
 	obs_data_array_release(hotkeys);
@@ -364,9 +393,8 @@ static void screenshot_filter_destroy(void *data)
 	struct screenshot_filter_data *filter = data;
 
 	filter->exit = true;
-	for (int _ = 0; _ < 500 && !filter->exited; ++_) {
-		Sleep(10);
-	}
+	WaitForSingleObject(filter->image_writer_thread, 5000);
+	CloseHandle(filter->image_writer_thread);
 	if (filter->exited) {
 		info("Image writer thread stopped");
 	} else {
@@ -397,6 +425,9 @@ static void screenshot_filter_destroy(void *data)
 static void screenshot_filter_remove(void *data, obs_source_t *context)
 {
 	struct screenshot_filter_data *filter = data;
+	// libobs calls filter_remove even if create() failed and returned NULL
+	if (!filter)
+		return;
 	if (filter->capture_hotkey_id) {
 		obs_hotkey_unregister(filter->capture_hotkey_id);
 		filter->capture_hotkey_id = 0;
@@ -409,27 +440,8 @@ static void screenshot_filter_tick(void *data, float t)
 
 	obs_source_t *target = obs_filter_get_target(filter->context);
 
-	if (!target) {
-		filter->width = 0;
-		filter->height = 0;
-
-		if (filter->staging_texture) {
-			obs_enter_graphics();
-			gs_stagesurface_destroy(filter->staging_texture);
-			obs_leave_graphics();
-			filter->staging_texture = NULL;
-		}
-		if (filter->data) {
-			bfree(filter->data);
-			filter->data = NULL;
-		}
-		filter->ready = false;
-
-		return;
-	}
-
-	uint32_t width = obs_source_get_base_width(target);
-	uint32_t height = obs_source_get_base_height(target);
+	uint32_t width = target ? obs_source_get_base_width(target) : 0;
+	uint32_t height = target ? obs_source_get_base_height(target) : 0;
 
 	WaitForSingleObject(filter->mutex, INFINITE);
 	bool update = false;
@@ -442,20 +454,34 @@ static void screenshot_filter_tick(void *data, float t)
 		obs_enter_graphics();
 		if (filter->staging_texture) {
 			gs_stagesurface_destroy(filter->staging_texture);
+			filter->staging_texture = NULL;
 		}
-		filter->staging_texture = gs_stagesurface_create(
-			filter->width, filter->height, GS_RGBA);
+		if (width && height)
+			filter->staging_texture = gs_stagesurface_create(
+				width, height, GS_RGBA);
 		obs_leave_graphics();
-		info("Created Staging texture %d by %d: %x", width, height,
-		     filter->staging_texture);
 
 		if (filter->data) {
 			bfree(filter->data);
+			filter->data = NULL;
 		}
-		filter->data = bzalloc((width + 32) * height * 4);
+		// A source can report 0x0 (e.g. a media source restarting);
+		// OBS 30+ aborts on bmalloc(0), so only allocate for a real size.
+		if (width && height) {
+			filter->data = bzalloc(width * height * 4);
+			info("Created Staging texture %u by %u: %p", width,
+			     height, filter->staging_texture);
+		} else {
+			info("Source has no size, capture paused");
+		}
 		filter->ready = false;
 		filter->capture = false;
 		filter->since_last = 0.0f;
+	}
+
+	if (!width || !height || !filter->staging_texture) {
+		ReleaseMutex(filter->mutex);
+		return;
 	}
 
 	if (filter->destination_type == SETTING_DESTINATION_SHMEM_ID &&
@@ -464,20 +490,28 @@ static void screenshot_filter_tick(void *data, float t)
 				      sizeof(filter->shmem_name))) {
 			info("update shmem");
 			if (filter->shmem) {
-				info("Closing shmem \"%s\": %x",
+				info("Closing shmem \"%s\": %p",
 				     filter->shmem_name, filter->shmem);
 				CloseHandle(filter->shmem);
 			}
-			filter->shmem_size = 12 + (width + 32) * height * 4;
+			filter->shmem_size = 16 + width * height * 4;
 			wchar_t name[256];
-			mbstowcs(name, filter->destination, sizeof(name));
-			filter->shmem = CreateFileMapping(INVALID_HANDLE_VALUE,
-							  NULL, PAGE_READWRITE,
-							  0, filter->shmem_size,
-							  name);
+			filter->shmem = NULL;
+			if (MultiByteToWideChar(CP_UTF8, 0, filter->destination,
+						-1, name,
+						(int)(sizeof(name) /
+						      sizeof(name[0])))) {
+				filter->shmem = CreateFileMappingW(
+					INVALID_HANDLE_VALUE, NULL,
+					PAGE_READWRITE, 0, filter->shmem_size,
+					name);
+			} else {
+				warn("Shared memory name is too long: \"%s\"",
+				     filter->destination);
+			}
 			strncpy(filter->shmem_name, filter->destination,
 				sizeof(filter->shmem_name));
-			info("Created shmem \"%s\": %x", filter->shmem_name,
+			info("Created shmem \"%s\": %p", filter->shmem_name,
 			     filter->shmem);
 		}
 	}
@@ -507,7 +541,8 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 	obs_source_t *target = obs_filter_get_target(filter->context);
 	obs_source_t *parent = obs_filter_get_parent(filter->context);
 
-	if (!parent || !filter->width || !filter->height || !filter->capture) {
+	if (!parent || !filter->width || !filter->height || !filter->capture ||
+	    !filter->staging_texture || !filter->data) {
 		obs_source_skip_video_filter(filter->context);
 		return;
 	}
@@ -551,8 +586,14 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 		WaitForSingleObject(filter->mutex, INFINITE);
 		if (gs_stagesurface_map(filter->staging_texture, &data,
 					&linesize)) {
-			memcpy(filter->data, data, linesize * filter->height);
-			filter->linesize = linesize;
+			// The staging row pitch is driver-aligned and can be
+			// larger than width * 4, so copy row by row into a
+			// tightly packed buffer.
+			uint32_t row_size = filter->width * 4;
+			for (uint32_t y = 0; y < filter->height; y++)
+				memcpy(filter->data + y * row_size,
+				       data + y * linesize, row_size);
+			filter->linesize = row_size;
 			filter->ready = true;
 
 			gs_stagesurface_unmap(filter->staging_texture);
@@ -569,107 +610,35 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 	}
 }
 
-// code adapted from https://github.com/obsproject/obs-studio/pull/1269 and https://stackoverflow.com/a/12563019
+static void png_write_callback(void *context, void *data, int size)
+{
+	struct darray *buf = context;
+	darray_push_back_array(sizeof(uint8_t), buf, data, size);
+}
+
 static bool write_image(const char *destination, uint8_t *image_data_ptr,
 			uint32_t image_data_linesize, uint32_t width,
 			uint32_t height, int destination_type)
 {
-	bool success = false;
-
-	int ret;
-	AVFrame *frame;
-	AVPacket pkt;
-
 	if (image_data_ptr == NULL)
-		goto err_no_image_data;
+		return false;
 
-	const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
-	if (codec == NULL)
-		goto err_png_codec_not_found;
+	struct darray png;
+	darray_init(&png);
 
-	AVCodecContext *codec_context = avcodec_alloc_context3(codec);
-	if (codec_context == NULL)
-		goto err_png_encoder_context_alloc;
-
-	codec_context->bit_rate = 400000;
-	codec_context->width = width;
-	codec_context->height = height;
-	codec_context->time_base = (AVRational){1, 25};
-	codec_context->pix_fmt = AV_PIX_FMT_RGBA;
-
-	if (avcodec_open2(codec_context, codec, NULL) != 0)
-		goto err_png_encoder_open;
-
-	frame = av_frame_alloc();
-	if (frame == NULL)
-		goto err_av_frame_alloc;
-
-	frame->format = codec_context->pix_fmt;
-	frame->width = width;
-	frame->height = height;
-
-	ret = av_image_alloc(frame->data, frame->linesize, codec_context->width,
-			     codec_context->height, codec_context->pix_fmt, 4);
-	if (ret < 0)
-		goto err_av_image_alloc;
-
-	av_init_packet(&pkt);
-	pkt.data = NULL;
-	pkt.size = 0;
-
-	for (int y = 0; y < height; ++y)
-		memcpy(frame->data[0] + y * width * 4,
-		       image_data_ptr + y * image_data_linesize, width * 4);
-	frame->pts = 1;
-
-#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(57, 40, 101)
-	int got_output = 0;
-	ret = avcodec_encode_video2(codec_context, &pkt, frame, &got_output);
-	if (ret == 0 && got_output) {
-		success = write_data(destination, pkt.data, pkt.size,
+	bool success = false;
+	if (stbi_write_png_to_func(png_write_callback, &png, (int)width,
+				   (int)height, 4, image_data_ptr,
+				   (int)image_data_linesize) &&
+	    png.num) {
+		success = write_data(destination, png.array, png.num,
 				     "image/png", width, height,
 				     destination_type);
-		av_free_packet(&pkt);
-	}
-#else
-	ret = avcodec_send_frame(codec_context, frame);
-	if (ret < 0)
-		goto err_av_image_alloc;
-	ret = avcodec_receive_packet(codec_context, &pkt);
-	if (ret < 0 || ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-		goto err_av_image_alloc;
 	} else {
-		success = write_data(destination, pkt.data, pkt.size,
-				     "image/png", width, height,
-				     destination_type);
-		av_packet_unref(&pkt);
+		warn("Failed to encode PNG (%ux%u)", width, height);
 	}
-#endif
 
-	av_freep(frame->data);
-
-err_av_image_alloc:
-	// Failed allocating image data buffer
-	av_frame_free(&frame);
-	frame = NULL;
-
-err_av_frame_alloc:
-	// Failed allocating frame
-	avcodec_close(codec_context);
-
-err_png_encoder_open:
-	// Failed opening PNG encoder
-	avcodec_free_context(&codec_context);
-	codec_context = NULL;
-
-err_png_encoder_context_alloc:
-	// failed allocating PNG encoder context
-	// no need to free AVCodec* codec
-err_png_codec_not_found:
-	// PNG encoder not found
-err_no_image_data:
-	// image_data_ptr == NULL
-
+	darray_free(&png);
 	return success;
 }
 
@@ -693,7 +662,7 @@ static bool write_data(const char *destination, uint8_t *data, size_t len,
 		if (strstr(destination, "http://") != NULL ||
 		    strstr(destination, "https://") != NULL) {
 			//info("PUT %s (%d bytes)", destination, len);
-			success = put_data(destination, data, len, content_type,
+			success = put_data((char *)destination, data, len, content_type,
 					   width, height);
 		}
 	}
@@ -816,7 +785,7 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 		goto err_internet_open;
 
 	HINTERNET hConn = InternetConnectA(hIntrn, host, port, NULL, NULL,
-					   INTERNET_SERVICE_HTTP, 0, NULL);
+					   INTERNET_SERVICE_HTTP, 0, 0);
 	if (!hConn)
 		goto err_internet_connect;
 
@@ -826,24 +795,21 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 				   INTERNET_FLAG_NO_UI | INTERNET_FLAG_RELOAD;
 
 	HINTERNET hReq = HttpOpenRequestA(hConn, "PUT", location, "HTTP/1.1",
-					  NULL, NULL, dwOpenRequestFlags, NULL);
+					  NULL, NULL, dwOpenRequestFlags, 0);
 	if (!hReq)
 		goto err_http_open_request;
 
-	char header[1024] = {0};
-	snprintf(header, sizeof(header), "%sContent-Type: %s\r\n", header,
-		 content_type);
-	snprintf(header, sizeof(header), "%sImage-Width: %d\r\n", header,
-		 width);
-	snprintf(header, sizeof(header), "%sImage-Height: %d\r\n", header,
-		 height);
+	char header[1024];
+	snprintf(header, sizeof(header),
+		 "Content-Type: %s\r\nImage-Width: %d\r\nImage-Height: %d\r\n",
+		 content_type, width, height);
 
-	if (HttpSendRequestA(hReq, header, strnlen(header, sizeof(header)), buf,
-			     len)) {
+	if (HttpSendRequestA(hReq, header, (DWORD)strlen(header), buf,
+			     (DWORD)len)) {
 		success = true;
 		info("Uploaded file to %s:%d%s", host, port, location);
 	} else {
-		warn("Failed to upload file to http://%s:%d%s - %d", host, port,
+		warn("Failed to upload file to http://%s:%d%s - %lu", host, port,
 		     location, GetLastError());
 	}
 
@@ -866,8 +832,8 @@ static void capture_key_callback(void *data, obs_hotkey_id id,
 {
 	struct screenshot_filter_data *filter = data;
 	const char *filter_name = obs_source_get_name(filter->context);
-	info("Got capture_key pressed for %s, id: %d, key: %s, pressed: %d",
-	     filter_name, id, obs_hotkey_get_name(key), pressed);
+	info("Got capture_key pressed for %s, id: %llu, key: %s, pressed: %d",
+	     filter_name, (unsigned long long)id, obs_hotkey_get_name(key), pressed);
 
 	if (id != filter->capture_hotkey_id || !pressed)
 		return;
