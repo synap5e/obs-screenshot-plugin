@@ -7,16 +7,16 @@
 #include <obs-module.h>
 #include <obs-hotkey.h>
 #include <util/darray.h>
+#include <util/platform.h>
 
 // PNG encoding is done with stb_image_write instead of FFmpeg: linking against
 // OBS's FFmpeg DLLs ties the plugin to one OBS major version (avcodec-60/61/62).
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
 #define STBI_WRITE_NO_STDIO
-// plain CRT allocator: bmalloc aborts OBS on failure, stb handles NULL
-#define STBIW_MALLOC(sz) malloc(sz)
-#define STBIW_REALLOC(p, newsz) realloc(p, newsz)
-#define STBIW_FREE(p) free(p)
+#define STBIW_MALLOC(sz) bmalloc(sz)
+#define STBIW_REALLOC(p, newsz) brealloc(p, newsz)
+#define STBIW_FREE(p) bfree(p)
 #include "stb_image_write.h"
 
 OBS_DECLARE_MODULE()
@@ -385,8 +385,12 @@ static void screenshot_filter_load(void *data, obs_data_t *settings)
 {
 	struct screenshot_filter_data *filter = data;
 
-	info("Registering hotkey on filter load for filter %p", filter);
-	make_hotkey(filter);
+	// render may already have registered it
+	if (!filter->capture_hotkey_id) {
+		info("Registering hotkey on filter load for filter %p",
+		     filter);
+		make_hotkey(filter);
+	}
 
 	obs_data_array_t *hotkeys =
 		obs_data_get_array(settings, "capture_hotkey");
@@ -401,6 +405,12 @@ static void screenshot_filter_load(void *data, obs_data_t *settings)
 static void screenshot_filter_destroy(void *data)
 {
 	struct screenshot_filter_data *filter = data;
+
+	// the hotkey callback must not run on a freed filter
+	if (filter->capture_hotkey_id) {
+		obs_hotkey_unregister(filter->capture_hotkey_id);
+		filter->capture_hotkey_id = 0;
+	}
 
 	// Wait for the writer thread to finish for real: freeing the filter
 	// while it is still encoding or uploading crashes OBS. Uploads are
@@ -478,12 +488,14 @@ static void screenshot_filter_tick(void *data, float t)
 		}
 		// A source can report 0x0 (e.g. a media source restarting);
 		// OBS 30+ aborts on bmalloc(0), so only allocate for a real size.
-		if (width && height) {
-			filter->data = bzalloc(width * height * 4);
+		// only allocate when the GPU accepted the size (<= 16384)
+		if (filter->staging_texture) {
+			filter->data = bzalloc((size_t)width * height * 4);
 			info("Created Staging texture %u by %u: %p", width,
 			     height, filter->staging_texture);
 		} else {
-			info("Source has no size, capture paused");
+			info("Unsupported source size %ux%u, capture paused",
+			     width, height);
 		}
 		filter->ready = false;
 		filter->capture = false;
@@ -499,8 +511,9 @@ static void screenshot_filter_tick(void *data, float t)
 
 	if (filter->destination_type == SETTING_DESTINATION_SHMEM_ID &&
 	    filter->destination) {
+		// shmem_name keeps at most sizeof - 1 bytes, compare as many
 		if (update || strncmp(filter->destination, filter->shmem_name,
-				      sizeof(filter->shmem_name))) {
+				      sizeof(filter->shmem_name) - 1)) {
 			info("update shmem");
 			if (filter->shmem) {
 				info("Closing shmem \"%s\": %p",
@@ -523,7 +536,9 @@ static void screenshot_filter_tick(void *data, float t)
 				     filter->destination);
 			}
 			strncpy(filter->shmem_name, filter->destination,
-				sizeof(filter->shmem_name));
+				sizeof(filter->shmem_name) - 1);
+			filter->shmem_name[sizeof(filter->shmem_name) - 1] =
+				'\0';
 			info("Created shmem \"%s\": %p", filter->shmem_name,
 			     filter->shmem);
 		}
@@ -547,14 +562,16 @@ static void screenshot_filter_render(void *data, gs_effect_t *effect)
 	struct screenshot_filter_data *filter = data;
 	UNUSED_PARAMETER(effect);
 
-	if (!filter->capture_hotkey_id) {
+	obs_source_t *target = obs_filter_get_target(filter->context);
+	obs_source_t *parent = obs_filter_get_parent(filter->context);
+
+	// no parent: the filter is being removed, don't register a hotkey
+	// that nothing would unregister
+	if (!filter->capture_hotkey_id && parent) {
 		info("Registering hotkey on filter render for filter %p",
 		     filter);
 		make_hotkey(filter);
 	}
-
-	obs_source_t *target = obs_filter_get_target(filter->context);
-	obs_source_t *parent = obs_filter_get_parent(filter->context);
 
 	if (!parent || !filter->width || !filter->height || !filter->capture ||
 	    !filter->staging_texture || !filter->data) {
@@ -664,7 +681,7 @@ static bool write_data(const char *destination, uint8_t *data, size_t len,
 	bool success = false;
 
 	if (destination_type == SETTING_DESTINATION_PATH_ID) {
-		FILE *of = fopen(destination, "wb");
+		FILE *of = os_fopen(destination, "wb");
 
 		if (of != NULL) {
 			//info("write %s (%d bytes)", destination, len);
@@ -682,7 +699,7 @@ static bool write_data(const char *destination, uint8_t *data, size_t len,
 		}
 	}
 	if (destination_type == SETTING_DESTINATION_FOLDER_ID) {
-		FILE *of = fopen(destination, "rb");
+		FILE *of = os_fopen(destination, "rb");
 
 		if (of != NULL) {
 			fclose(of);
@@ -725,13 +742,13 @@ static bool write_data(const char *destination, uint8_t *data, size_t len,
 					break;
 				}
 
-				of = fopen(file_destination, "rb");
+				of = os_fopen(file_destination, "rb");
 				if (of != NULL) {
 					fclose(of);
 					continue;
 				}
 
-				of = fopen(file_destination, "wb");
+				of = os_fopen(file_destination, "wb");
 				if (of == NULL) {
 					continue;
 				} else {
@@ -795,7 +812,7 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 	char *location = location_start;
 
 	HINTERNET hIntrn = InternetOpenA(
-		"OBS Screenshot Plugin/1.2.1",
+		"OBS Screenshot Plugin/1.6.0",
 		INTERNET_OPEN_TYPE_PRECONFIG_WITH_NO_AUTOPROXY, NULL, NULL, 0);
 	if (!hIntrn)
 		goto err_internet_open;
@@ -809,6 +826,9 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 			   sizeof(timeout_ms));
 	InternetSetOptionA(hIntrn, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout_ms,
 			   sizeof(timeout_ms));
+	DWORD retries = 1;
+	InternetSetOptionA(hIntrn, INTERNET_OPTION_CONNECT_RETRIES, &retries,
+			   sizeof(retries));
 
 	HINTERNET hConn = InternetConnectA(hIntrn, host, port, NULL, NULL,
 					   INTERNET_SERVICE_HTTP, 0, 0);
