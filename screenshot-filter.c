@@ -13,9 +13,10 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
 #define STBI_WRITE_NO_STDIO
-#define STBIW_MALLOC(sz) bmalloc(sz)
-#define STBIW_REALLOC(p, newsz) brealloc(p, newsz)
-#define STBIW_FREE(p) bfree(p)
+// plain CRT allocator: bmalloc aborts OBS on failure, stb handles NULL
+#define STBIW_MALLOC(sz) malloc(sz)
+#define STBIW_REALLOC(p, newsz) realloc(p, newsz)
+#define STBIW_FREE(p) free(p)
 #include "stb_image_write.h"
 
 OBS_DECLARE_MODULE()
@@ -86,7 +87,7 @@ struct screenshot_filter_data {
 	HANDLE shmem;
 
 	HANDLE mutex;
-	bool exit;
+	volatile bool exit;
 	bool exited;
 };
 
@@ -96,7 +97,7 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 		WaitForSingleObject(filter->mutex, INFINITE);
 		// copy all props & data inside the mutex, then do the processing/write/put outside of the mutex
 		uint8_t *data = NULL;
-		char *destination = filter->destination;
+		char *destination = NULL;
 		int destination_type = filter->destination_type;
 		uint32_t width = filter->width;
 		uint32_t height = filter->height;
@@ -125,9 +126,12 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 				}
 			}
 			filter->index += 1;
-		} else if (ready) {
+		} else if (ready && filter->destination &&
+			   *filter->destination) {
 			data = bzalloc(linesize * height);
 			memcpy(data, filter->data, linesize * height);
+			// update() may replace the string while we write
+			destination = bstrdup(filter->destination);
 		}
 		ReleaseMutex(filter->mutex);
 
@@ -141,6 +145,7 @@ static DWORD CALLBACK write_images_thread(struct screenshot_filter_data *filter)
 					    height, destination_type);
 			filter->index += 1;
 			bfree(data);
+			bfree(destination);
 		}
 		Sleep(200);
 	}
@@ -272,15 +277,20 @@ static void screenshot_filter_update(void *data, obs_data_t *settings)
 	WaitForSingleObject(filter->mutex, INFINITE);
 
 	filter->destination_type = type;
+	// keep our own copy: strings from settings can be freed when the
+	// user edits the properties, while the writer thread still uses them
+	const char *destination = NULL;
 	if (type == SETTING_DESTINATION_PATH_ID) {
-		filter->destination = (char *)path;
+		destination = path;
 	} else if (type == SETTING_DESTINATION_URL_ID) {
-		filter->destination = (char *)url;
+		destination = url;
 	} else if (type == SETTING_DESTINATION_SHMEM_ID) {
-		filter->destination = (char *)shmem_name;
+		destination = shmem_name;
 	} else if (type == SETTING_DESTINATION_FOLDER_ID) {
-		filter->destination = (char *)folder_path;
+		destination = folder_path;
 	}
+	bfree(filter->destination);
+	filter->destination = destination ? bstrdup(destination) : NULL;
 	info("Set destination=%s, %d", filter->destination,
 	     filter->destination_type);
 
@@ -392,31 +402,31 @@ static void screenshot_filter_destroy(void *data)
 {
 	struct screenshot_filter_data *filter = data;
 
+	// Wait for the writer thread to finish for real: freeing the filter
+	// while it is still encoding or uploading crashes OBS. Uploads are
+	// bounded by the WinINet timeouts set in put_data.
 	filter->exit = true;
-	WaitForSingleObject(filter->image_writer_thread, 5000);
+	WaitForSingleObject(filter->image_writer_thread, INFINITE);
 	CloseHandle(filter->image_writer_thread);
-	if (filter->exited) {
-		info("Image writer thread stopped");
-	} else {
-		// This is not good... Hopefully the thread has crashed, otherwise it's going to be working with filter after it has been free'd
-		warn("Image writer thread failed to stop");
-	}
+	info("Image writer thread stopped");
 
-	WaitForSingleObject(filter->mutex, INFINITE);
+	// same lock order as tick and render: graphics first, then mutex
 	obs_enter_graphics();
+	WaitForSingleObject(filter->mutex, INFINITE);
 	gs_texrender_destroy(filter->texrender);
 	if (filter->staging_texture) {
 		gs_stagesurface_destroy(filter->staging_texture);
 	}
-	obs_leave_graphics();
 	if (filter->data) {
 		bfree(filter->data);
 	}
+	bfree(filter->destination);
 
 	if (filter->shmem) {
 		CloseHandle(filter->shmem);
 	}
 	ReleaseMutex(filter->mutex);
+	obs_leave_graphics();
 	CloseHandle(filter->mutex);
 
 	bfree(filter);
@@ -443,15 +453,17 @@ static void screenshot_filter_tick(void *data, float t)
 	uint32_t width = target ? obs_source_get_base_width(target) : 0;
 	uint32_t height = target ? obs_source_get_base_height(target) : 0;
 
+	// width/height are only written here, on the graphics thread, so they
+	// can be compared before locking. Lock order everywhere: graphics
+	// context first, then the filter mutex (render runs inside graphics).
+	bool update = width != filter->width || height != filter->height;
+	if (update)
+		obs_enter_graphics();
 	WaitForSingleObject(filter->mutex, INFINITE);
-	bool update = false;
-	if (width != filter->width || height != filter->height) {
-		update = true;
-
+	if (update) {
 		filter->width = width;
 		filter->height = height;
 
-		obs_enter_graphics();
 		if (filter->staging_texture) {
 			gs_stagesurface_destroy(filter->staging_texture);
 			filter->staging_texture = NULL;
@@ -459,7 +471,6 @@ static void screenshot_filter_tick(void *data, float t)
 		if (width && height)
 			filter->staging_texture = gs_stagesurface_create(
 				width, height, GS_RGBA);
-		obs_leave_graphics();
 
 		if (filter->data) {
 			bfree(filter->data);
@@ -481,6 +492,8 @@ static void screenshot_filter_tick(void *data, float t)
 
 	if (!width || !height || !filter->staging_texture) {
 		ReleaseMutex(filter->mutex);
+		if (update)
+			obs_leave_graphics();
 		return;
 	}
 
@@ -525,6 +538,8 @@ static void screenshot_filter_tick(void *data, float t)
 	}
 
 	ReleaseMutex(filter->mutex);
+	if (update)
+		obs_leave_graphics();
 }
 
 static void screenshot_filter_render(void *data, gs_effect_t *effect)
@@ -674,8 +689,11 @@ static bool write_data(const char *destination, uint8_t *data, size_t len,
 		} else {
 			time_t nowunixtime = time(NULL);
 			struct tm *nowtime = localtime(&nowunixtime);
+			if (!nowtime)
+				return false;
 			char _file_destination[260];
 			char file_destination[260];
+			bool png = !strcmp(content_type, "image/png");
 
 			int dest_length = snprintf(
 				_file_destination, 259,
@@ -689,23 +707,21 @@ static bool write_data(const char *destination, uint8_t *data, size_t len,
 				if (repeat_count > 5) {
 					break;
 				}
-				dest_length = snprintf(file_destination, 259,
-						       "%s", _file_destination);
-				if (repeat_count > 0) {
+				// name.png / name_N.png, raw: name / name_N.raw
+				if (repeat_count > 0)
 					dest_length = snprintf(
 						file_destination, 259,
-						"%s_%d.raw", _file_destination,
-						repeat_count);
-				}
+						"%s_%d%s", _file_destination,
+						repeat_count,
+						png ? ".png" : ".raw");
+				else
+					dest_length = snprintf(
+						file_destination, 259, "%s%s",
+						_file_destination,
+						png ? ".png" : "");
 				repeat_count++;
 
-				if (!strcmp(content_type, "image/png")) {
-					dest_length = snprintf(
-						file_destination, 259, "%s.png",
-						file_destination);
-				}
-
-				if (dest_length <= 0) {
+				if (dest_length <= 0 || dest_length >= 259) {
 					break;
 				}
 
@@ -783,6 +799,16 @@ static bool put_data(char *url, uint8_t *buf, size_t len, char *content_type,
 		INTERNET_OPEN_TYPE_PRECONFIG_WITH_NO_AUTOPROXY, NULL, NULL, 0);
 	if (!hIntrn)
 		goto err_internet_open;
+
+	// bound how long an unreachable server can block the writer thread
+	// (destroy waits for it)
+	DWORD timeout_ms = 5000;
+	InternetSetOptionA(hIntrn, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout_ms,
+			   sizeof(timeout_ms));
+	InternetSetOptionA(hIntrn, INTERNET_OPTION_SEND_TIMEOUT, &timeout_ms,
+			   sizeof(timeout_ms));
+	InternetSetOptionA(hIntrn, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout_ms,
+			   sizeof(timeout_ms));
 
 	HINTERNET hConn = InternetConnectA(hIntrn, host, port, NULL, NULL,
 					   INTERNET_SERVICE_HTTP, 0, 0);
